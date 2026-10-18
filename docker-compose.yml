@@ -1,22 +1,38 @@
 services:
   rclone-bot:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: rclone-tg-bot
     restart: unless-stopped
     env_file:
       - config.env
+    environment:
+      - MALLOC_ARENA_MAX=2
+      - RCLONE_BUFFER_SIZE=32M
+      - MONGO_URI=${MONGO_URI:-mongodb://mongo:27017}
+      - MONGO_DB_NAME=${MONGO_DB_NAME:-rclone_tg_bot}
+    depends_on:
+      - mongo
     ports:
       - "8080:8080"
     volumes:
-      # Provide rclone.conf directly instead of RCLONE_CONF/RCLONE_CONF_URL
-      - ./rclone.conf:/root/.config/rclone/rclone.conf:ro
-      # Persist stats and the pyrogram session across restarts
+      # Persist Pyrogram session and local cache across restarts
       - bot-data:/app
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health')"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
       interval: 30s
       timeout: 5s
       retries: 3
 
+  mongo:
+    image: mongo:7-jammy
+    container_name: rclone-tg-mongo
+    restart: unless-stopped
+    command: ["mongod", "--quiet", "--logpath", "/dev/null"]
+    volumes:
+      - mongo-data:/data/db
+
 volumes:
   bot-data:
+  mongo-data:

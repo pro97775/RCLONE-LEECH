@@ -1,14 +1,31 @@
+# Git & IDE
 .git
 .gitignore
-.gitlab-ci.yml
-README.md
-LICENSE
-config.env
-config.env.example
-docker-compose.yml
+.idea
+.vscode
+*.swp
+.DS_Store
+
+# Python cache & virtual environments
 __pycache__/
 *.py[cod]
+*.egg-info/
 .venv/
 venv/
+env/
+
+# Runtime & secrets (passed via env/volumes instead of baking into image)
+config.env
+rclone.conf
+*.conf.bak
 *.session
+*.session-journal
+/tmp/
+rclone_dl/
+*_parts/
 rclone_bot_stats.json
+
+# Documentation & unused scripts
+README.md
+LICENSE
+"with size limit bot.py"

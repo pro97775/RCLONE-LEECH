@@ -1,8 +1,7 @@
 pyrotgfork
 pytgcrypto
 psutil==5.9.8
-#pyrofork==2.3.42
-#TgCrypto
-#pyrogram==2.0.106
-#TgCrypto==1.2.5
-
+motor>=3.3.0
+pymongo>=4.6.0
+dnspython>=2.6.0
+uvloop; sys_platform != "win32"
