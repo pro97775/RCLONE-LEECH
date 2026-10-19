@@ -2,40 +2,28 @@ services:
   rclone-bot:
     build:
       context: .
-      dockerfile: Dockerfile
-      args:
-        # Set to "wzgram" (Rust WarpCrypto) or "kurigram[fast]" (Kurigram + TgCrypto)
-        MTPROTO_LIB: ${MTPROTO_LIB:-wzgram}
-    container_name: rclone-tg-bot
+    container_name: rclone-telegram-bot
     restart: unless-stopped
     env_file:
       - config.env
-    environment:
-      - MALLOC_ARENA_MAX=2
-      - RCLONE_BUFFER_SIZE=32M
-      - MONGO_URI=${MONGO_URI:-mongodb://mongo:27017}
-      - MONGO_DB_NAME=${MONGO_DB_NAME:-rclone_tg_bot}
-    depends_on:
-      - mongo
     ports:
-      - "8080:8080"
+      - "${PORT:-8080}:8080"
     volumes:
-      # Persist session and local cache across restarts
-      - bot-data:/app
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=3)"]
-      interval: 30s
-      timeout: 5s
-      retries: 3
-
-  mongo:
-    image: mongo:7-jammy
-    container_name: rclone-tg-mongo
-    restart: unless-stopped
-    command: ["mongod", "--quiet", "--logpath", "/dev/null"]
-    volumes:
-      - mongo-data:/data/db
+      - rclone_config:/root/.config/rclone
+      - bot_session:/app
+    tmpfs:
+      - /tmp/rclone_dl:rw,noexec,nosuid,size=6g
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 1024M
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
 
 volumes:
-  bot-data:
-  mongo-data:
+  rclone_config:
+  bot_session:

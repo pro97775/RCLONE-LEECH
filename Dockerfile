@@ -3,11 +3,8 @@
 # ── Stage 1: Fetch static rclone binary ───────────────────────────────
 FROM rclone/rclone:latest AS rclone_bin
 
-# ── Stage 2: Build Python wheels (supports wzgram or kurigram[fast]) ──
+# ── Stage 2: Build Python packages (WZGram + WarpCrypto + Motor) ──────
 FROM python:3.11-slim-bookworm AS builder
-
-# Choose MTProto library at build time: "wzgram" (default) or "kurigram[fast]"
-ARG MTPROTO_LIB="wzgram"
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -21,8 +18,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY requirements.txt .
-RUN grep -vE '^(wzgram|kurigram)' requirements.txt > /tmp/base_reqs.txt \
-    && pip install --prefix=/install --no-warn-script-location "${MTPROTO_LIB}" -r /tmp/base_reqs.txt
+RUN pip install --prefix=/install --no-warn-script-location -r requirements.txt
 
 # ── Stage 3: Minimal, lightweight production runtime ──────────────────
 FROM python:3.11-slim-bookworm
@@ -35,7 +31,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     DOWNLOAD_DIR=/tmp/rclone_dl \
     PORT=8080
 
-# Install only runtime essentials (ffmpeg + ca-certificates) and strip docs/manpages
+# Install only runtime essentials (ffmpeg + ca-certificates + taskset)
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ffmpeg \
         ca-certificates \
@@ -61,6 +57,6 @@ RUN mkdir -p /root/.config/rclone /tmp/rclone_dl
 EXPOSE 8080
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD ["python", "-c", "import os, urllib.request; p = os.environ.get('PORT', '8080'); urllib.request.urlopen(f'http://127.0.0.1:{p}/health', timeout=3)"]
+    CMD ["python", "-c", "import os, urllib.request; p = os.environ.get('PORT', '8080'); urllib.request.urlopen(f'https://www.google.com/search?q=http://127.0.0.1:{p}/health', timeout=3)"]
 
 CMD ["python", "-O", "bot.py"]

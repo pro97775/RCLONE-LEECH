@@ -1,28 +1,23 @@
-# Rclone ➔ Telegram Transfer Bot (WZGram / Kurigram + MongoDB Edition)
+# ☁️ Rclone ➔ Telegram Transfer Bot (WZGram + MongoDB)
 
-A fast, lightweight, async Telegram bot powered by **[WZGram](https://wzgram.com/)** (with Rust `WarpCrypto`) or **[Kurigram](https://docs.kurigram.icu/)** (`kurigram[fast]`) that downloads media from any [rclone](https://rclone.org)-supported remote and uploads it straight to Telegram with **MongoDB config & `rclone.conf` persistence**, **automatic job resumption on restart**, **auto-registered commands**, **visual folder browsing**, and an **optimized multi-stage Docker image**.
+High-speed, lightweight cloud-to-Telegram media transfer bot powered by **[WZGram](https://wzgram.com/)** (Rust `WarpCrypto`), **Rclone**, **FFmpeg**, and **Async Motor MongoDB**.
 
-## Switching Between WZGram and Kurigram
+## ✨ Key Features
+- **Pure WZGram Engine**: Built exclusively on `wzgram` with Rust-accelerated `WarpCrypto` for maximum MTProto upload throughput.
+- **Full MongoDB Persistence & Auto-Resume**:
+  - Automatically persists all settings, **Concurrency Setup** (`CONCURRENT_JOBS`, `RCLONE_STREAMS`, `RCLONE_BUFFER_SIZE`), `rclone.conf`, authorized users, and transfer statistics in MongoDB.
+  - Checkpoints active transfer jobs after every file and automatically resumes unfinished jobs on container/bot restart.
+- **Dedicated Concurrency & Streams Setup UI (`/concurrent`)**:
+  - Interactive 1-tap buttons for Parallel Jobs (`1x`–`5x`), Rclone Multi-Thread Streams (`2`–`16`), and Rclone Buffer Size (`16M`–`128M`), synced live to WZGram's `max_concurrent_transmissions` and saved in MongoDB.
+- **Midpoint Video Thumbnails & Metadata**:
+  - Automatically probes video `(duration, width, height)` via `ffprobe` and extracts a `<= 320×320` JPEG thumbnail from the exact middle (`duration / 2`) of every video and split part.
+- **Auto-Registered Bot Commands**:
+  - Automatically registers all slash commands across Default, Private Chat, and Group Chat scopes on startup.
 
-`bot.py` features a **Dual MTProto Engine Loader** that automatically detects and runs whichever library is installed (`wzgram` or `kurigram`), including automatic `ReplyParameters` compatibility:
-
-- **Default (`WZGram` + Rust `WarpCrypto`)**:
-  ```bash
-  pip install -r requirements.txt
-  # or via Docker:
-  docker compose build --build-arg MTPROTO_LIB="wzgram"
-  ```
-- **Alternative (`Kurigram` + `TgCrypto`)**:
-  Uncomment `kurigram[fast]` (and comment out `wzgram`) in `requirements.txt`, or pass the Docker build argument:
-  ```bash
-  docker compose build --build-arg MTPROTO_LIB="kurigram[fast]"
-  ```
-
-## Highlights
-
-- **🚀 WZGram & Kurigram Native Support** — Uses modern `ReplyParameters(message_id=...)` with automatic signature inspection and displays the active MTProto engine (`WZGram` or `Kurigram`) in `/start`, `/status`, and `/health`.
-- **🗄 Full MongoDB Persistence (`MONGO_URI`)** — Saves all runtime settings (`Auto-Delete`, `Size Cap`, `Concurrency`, `BW Limit`, `Refresh Rate`, `Default Mode`, `Authorized Users`), lifetime transfer statistics, and your uploaded **`rclone.conf`** directly in MongoDB (`motor` async driver).
-- **▶️ Auto-Start / Auto-Resume on Bot Restart** — Active transfer jobs checkpoint their progress to MongoDB after every file. If the bot restarts or redeploys mid-job, it automatically resumes remaining files on startup without re-uploading completed ones.
-- **📲 Automatic Bot Command Registration** — Calls `set_bot_commands` across Default, Private Chat, and Group scopes automatically on startup so the `/` command menu is always populated without `@BotFather`.
-- **🗂 Interactive Remote & Folder Browser (`/remotes`)** — Navigate cloud remotes and subfolders with inline pagination buttons and start transfers with one tap.
-- **🎛 Interactive Control Panels (`/settings` & `/db`)** — Configure every setting or trigger database syncs/restores using inline buttons.
+## 🚀 Quick Start (Docker)
+1. Copy `config.env.example` to `config.env` and fill in `API_ID`, `API_HASH`, `BOT_TOKEN`, `OWNER_ID`, `DUMP_CHAT_ID`, and `MONGO_URI`.
+2. Build and launch:
+   ```bash
+   docker compose up -d --build
+   ```
+3. Send `/start` to your bot in Telegram, upload your `rclone.conf` via **🔧 Upload rclone.conf**, and browse your remotes with **🗂 Browse Remotes**!
