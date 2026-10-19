@@ -1,8 +1,9 @@
 # ==============================================================================
-#  Rclone ➔ Telegram Transfer Bot (Async + MongoDB Persistence + Auto-Resume)
+#  Rclone ➔ Telegram Transfer Bot
+#  Engines: WZGram (WarpCrypto) / Kurigram + Async Motor MongoDB + Auto-Resume
 # ==============================================================================
 #  Architecture Overview:
-#    1. Bootstrap & Event Loop (uvloop)
+#    1. Bootstrap, Event Loop (uvloop) & Dual MTProto Engine Loader (WZGram/Kurigram)
 #    2. Logging & In-Memory Ring Buffer
 #    3. Environment & Static Configuration
 #    4. MongoDB Persistence Engine (Settings, rclone.conf, Stats, Job Auto-Resume)
@@ -13,7 +14,7 @@
 #    9. Non-Blocking Async Subprocess Engine (rclone / ffmpeg / ffprobe)
 #   10. Live Transfer Progress Board
 #   11. Transfer Pipeline, Checkpointing & Auto-Resume Runner
-#   12. Telegram Command Handlers
+#   12. Telegram Command Handlers & Auto-Command Sync
 #   13. Unified Callback Query Router
 #   14. Startup Lifecycle, Auto Command Registration & Auto-Resume Hook
 # ==============================================================================
@@ -21,6 +22,7 @@
 import os
 import sys
 import asyncio
+import inspect
 import logging
 import shutil
 import time
@@ -33,7 +35,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
-# ── 1. Bootstrap & Event Loop (uvloop) ────────────────────────────────────────
+# ── 1. Bootstrap, Event Loop (uvloop) & Dual MTProto Engine Loader ────────────
 try:
     import uvloop
     uvloop.install()
@@ -50,18 +52,85 @@ try:
 except ImportError:
     AsyncIOMotorClient = None
 
-from pyrogram import Client, filters, idle
-from pyrogram.types import (
-    Message,
-    InlineKeyboardMarkup,
-    InlineKeyboardButton,
-    CallbackQuery,
-    BotCommand,
-    BotCommandScopeDefault,
-    BotCommandScopeAllPrivateChats,
-    BotCommandScopeAllGroupChats,
-)
-from pyrogram.errors import FloodWait, MessageNotModified
+# Prefer WZGram (Rust WarpCrypto) if installed; otherwise load Kurigram / Pyrogram
+MTPROTO_ENGINE = "Unknown"
+try:
+    import wzgram as _tg_pkg
+    from wzgram import Client, filters, idle
+    from wzgram.types import (
+        Message,
+        InlineKeyboardMarkup,
+        InlineKeyboardButton,
+        CallbackQuery,
+        BotCommand,
+        BotCommandScopeDefault,
+        BotCommandScopeAllPrivateChats,
+        BotCommandScopeAllGroupChats,
+    )
+    from wzgram.errors import FloodWait, MessageNotModified
+    try:
+        from wzgram.types import ReplyParameters
+    except ImportError:
+        ReplyParameters = None
+    MTPROTO_ENGINE = f"WZGram v{getattr(_tg_pkg, '__version__', 'latest')} (WarpCrypto)"
+except ImportError:
+    import pyrogram as _tg_pkg
+    from pyrogram import Client, filters, idle
+    from pyrogram.types import (
+        Message,
+        InlineKeyboardMarkup,
+        InlineKeyboardButton,
+        CallbackQuery,
+        BotCommand,
+        BotCommandScopeDefault,
+        BotCommandScopeAllPrivateChats,
+        BotCommandScopeAllGroupChats,
+    )
+    from pyrogram.errors import FloodWait, MessageNotModified
+    try:
+        from pyrogram.types import ReplyParameters
+    except ImportError:
+        ReplyParameters = None
+    MTPROTO_ENGINE = f"Kurigram v{getattr(_tg_pkg, '__version__', 'latest')}"
+
+
+def _build_reply_kwargs(method: Any, reply_to_message_id: int | None) -> dict[str, Any]:
+    """
+    Compatible reply helper for both WZGram and Kurigram:
+    Uses `reply_parameters=ReplyParameters(message_id=...)` on modern APIs
+    and falls back to `reply_to_message_id` when needed.
+    """
+    if not reply_to_message_id:
+        return {}
+    try:
+        params = inspect.signature(method).parameters
+        if "reply_parameters" in params and ReplyParameters is not None:
+            return {"reply_parameters": ReplyParameters(message_id=reply_to_message_id)}
+        if "reply_to_message_id" in params:
+            return {"reply_to_message_id": reply_to_message_id}
+    except Exception:
+        pass
+    if ReplyParameters is not None:
+        return {"reply_parameters": ReplyParameters(message_id=reply_to_message_id)}
+    return {"reply_to_message_id": reply_to_message_id}
+
+
+def _build_thumb_kwargs(method: Any, thumb: str | None) -> dict[str, Any]:
+    """
+    Compatible thumbnail parameter builder for WZGram, Kurigram, and Pyrogram:
+    Passes `thumb` or `thumbnail` depending on the method signature.
+    """
+    if not thumb:
+        return {}
+    try:
+        params = inspect.signature(method).parameters
+        if "thumb" in params:
+            return {"thumb": thumb}
+        if "thumbnail" in params:
+            return {"thumbnail": thumb}
+    except Exception:
+        pass
+    return {"thumb": thumb}
 
 
 # ── 2. Logging & In-Memory Ring Buffer ────────────────────────────────────────
@@ -295,7 +364,7 @@ class DatabaseManager:
     """
     Async MongoDB persistence layer using Motor.
     Automatically saves & restores:
-      • Bot settings & authorized users (`config` document)
+      • Bot settings & authorized users (`settings` document)
       • Full `rclone.conf` file content (`rclone_conf` document)
       • Lifetime transfer statistics (`stats` document)
       • In-progress job state (`active_job` document) for auto-resume on restart
@@ -334,7 +403,6 @@ class DatabaseManager:
             self.last_sync_ts = time.time()
             log.info(f"✅ Connected to MongoDB database: '{self.db_name}'")
             await self.load_all()
-            # If rclone.conf was provided via env/URL at boot, ensure it's backed up in MongoDB
             if _INITIAL_RCLONE_TEXT:
                 await self.save_rclone_conf(_INITIAL_RCLONE_TEXT, source="startup_env")
             return True
@@ -424,8 +492,6 @@ class DatabaseManager:
                 last_job_mode = data["last_job_mode"]
 
     async def load_all(self) -> None:
-        """Load settings, stats, and rclone.conf from MongoDB (or local fallback)."""
-        # First load local fallback if present
         if self.fallback_file.exists():
             try:
                 raw = json.loads(self.fallback_file.read_text(encoding="utf-8"))
@@ -450,7 +516,6 @@ class DatabaseManager:
                 self._apply_stats(stats_doc)
                 log.info("Restored transfer statistics from MongoDB")
 
-            # Restore rclone.conf from MongoDB if not already written or if stored in DB
             rc_doc = await self.db.bot_state.find_one({"_id": "rclone_conf"})
             if rc_doc and isinstance(rc_doc.get("content"), str) and rc_doc["content"].strip():
                 if not RCLONE_CONF_PATH.exists() or rc_doc.get("source") == "telegram_upload":
@@ -465,11 +530,9 @@ class DatabaseManager:
             log.warning(f"MongoDB load_all error: {e}")
 
     async def save_all(self) -> None:
-        """Save both settings and stats to local disk and MongoDB."""
         cfg = self._snapshot_settings()
         st = self._snapshot_stats()
 
-        # Always write local JSON cache
         try:
             combined = dict(st)
             combined["settings"] = cfg
@@ -490,14 +553,6 @@ class DatabaseManager:
         except Exception as e:
             self.last_error = str(e)[:120]
             log.debug(f"MongoDB save_all error: {e}")
-
-    def schedule_save(self) -> None:
-        """Fire-and-forget save from sync or async contexts."""
-        try:
-            loop = asyncio.get_running_loop()
-            loop.create_task(self.save_all())
-        except RuntimeError:
-            pass
 
     async def save_rclone_conf(self, content: str, source: str = "telegram_upload") -> None:
         if not self.connected or self.db is None:
@@ -522,7 +577,6 @@ class DatabaseManager:
             self.last_error = str(e)[:120]
             log.warning(f"Failed to save rclone.conf to MongoDB: {e}")
 
-    # ── Job Checkpointing & Auto-Resume ──
     async def save_active_job(
         self,
         remote_path: str,
@@ -592,7 +646,6 @@ class DatabaseManager:
                 pass
         return None
 
-    # ── Restart Marker ──
     async def save_restart_marker(self, chat_id: int, message_id: int) -> None:
         marker = {"chat_id": chat_id, "message_id": message_id, "ts": time.time()}
         try:
@@ -651,7 +704,7 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 failed = stats["total_failed"]
                 tbytes = stats["total_bytes"]
             body = (
-                f"status=ok\nuptime={h}h {m}m {s}s\n"
+                f"status=ok\nengine={MTPROTO_ENGINE}\nuptime={h}h {m}m {s}s\n"
                 f"mongodb={'connected' if db_mgr.connected else 'local_fallback'}\n"
                 f"active_jobs={len(active_sessions)}\n"
                 f"concurrent_limit={CONCURRENT_JOBS}\n"
@@ -983,7 +1036,8 @@ def _build_home_text() -> str:
     return (
         f"☁️ **Rclone ➔ Telegram Transfer Bot** · {state_badge}\n"
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
-        f"╭─ **Configuration & Storage**\n"
+        f"╭─ **Configuration & Engine**\n"
+        f"├ 🚀 **MTProto Engine:** `{MTPROTO_ENGINE}`\n"
         f"├ 🗄 **Storage:** `{db_badge}`\n"
         f"├ ▶️ **Auto-Resume on Restart:** `{'ON 🟢' if auto_res else 'OFF 🔴'}`\n"
         f"├ ⚡ **Concurrency:** `{conc}x` · 🚦 **BW:** `{bw}`\n"
@@ -1018,6 +1072,7 @@ def _build_status_text() -> str:
         f"━━━━━━━━━━━━━━━━━━━━━━\n"
         f"╭─ **Bot Telemetry**\n"
         f"├ 📡 **State:** {badge}\n"
+        f"├ 🚀 **Engine:** `{MTPROTO_ENGINE}`\n"
         f"├ 🗄 **Database:** {db_state}\n"
         f"├ ⏱ **Uptime:** `{fmt_uptime()}`\n"
         f"├ 🔄 **Active Jobs:** `{len(active_sessions)}` (Max `{conc}x` parallel)\n"
@@ -1282,10 +1337,10 @@ async def rclone_list(remote_path: str, user_id: int = 0) -> list[str]:
     code, out, err = await _run_cmd_async(cmd, user_id=user_id, timeout=180.0)
     if code != 0:
         raise RuntimeError(err.strip() or "rclone lsf failed")
-    allowed = VIDEO_EXTS | AUDIO_EXTS
+    allowed = VIDEO_EXTS | AUDIO_EXTS | IMAGE_EXTS
     return [
         f.strip().lstrip("/") for f in out.splitlines()
-        if f.strip() and f.strip().rsplit(".", 1)[-1].lower() in allowed
+        if f.strip() and "." in f and f.strip().rsplit(".", 1)[-1].lower() in allowed
     ]
 
 
@@ -1432,6 +1487,137 @@ async def rclone_delete(remote_path: str, user_id: int = 0) -> None:
     log.info(f"🗑 Deleted from remote: {remote_path}")
 
 
+def _parse_ffprobe_duration(data: dict[str, Any]) -> float:
+    """
+    Extract accurate video duration in seconds from ffprobe JSON output.
+    Checks format.duration first, then video/audio stream duration, then
+    MKV/WebM stream tags (HH:MM:SS.ms).
+    """
+    fmt_dur = data.get("format", {}).get("duration")
+    if fmt_dur is not None:
+        try:
+            val = float(fmt_dur)
+            if val > 0:
+                return val
+        except (ValueError, TypeError):
+            pass
+
+    for stream in data.get("streams", []):
+        s_dur = stream.get("duration")
+        if s_dur is not None:
+            try:
+                val = float(s_dur)
+                if val > 0:
+                    return val
+            except (ValueError, TypeError):
+                pass
+        tags = stream.get("tags") or {}
+        for k, v in tags.items():
+            if k.upper().startswith("DURATION") and isinstance(v, str):
+                m = re.match(r"^(\d+):(\d+):([\d.]+)", v.strip())
+                if m:
+                    try:
+                        val = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+                        if val > 0:
+                            return val
+                    except ValueError:
+                        pass
+    return 0.0
+
+
+async def probe_video_metadata(local_path: str, user_id: int = 0) -> tuple[int, int, int]:
+    """
+    Return `(duration_secs, width, height)` for a local video file using ffprobe.
+    """
+    rc, stdout, _ = await _run_cmd_async(
+        [
+            "ffprobe", "-hide_banner", "-loglevel", "error",
+            "-print_format", "json", "-show_format", "-show_streams",
+            local_path,
+        ],
+        user_id=user_id,
+        timeout=25.0,
+    )
+    if rc != 0 or not stdout:
+        return (0, 0, 0)
+    try:
+        data = json.loads(stdout)
+        duration = round(_parse_ffprobe_duration(data))
+        width, height = 0, 0
+        for s in data.get("streams", []):
+            if s.get("codec_type") == "video":
+                width = int(s.get("width") or 0)
+                height = int(s.get("height") or 0)
+                if width > 0 and height > 0:
+                    break
+        return (max(0, duration), max(0, width), max(0, height))
+    except Exception:
+        return (0, 0, 0)
+
+
+async def generate_thumbnail(
+    local_path: str,
+    user_id: int = 0,
+    duration: float | int | None = None,
+) -> str | None:
+    """
+    Extract a Telegram-compliant JPEG thumbnail (`<= 320x320 px`) from the exact
+    midpoint (`duration / 2`) of the video.
+    Falls back to 25% or 0s if a damaged container fails to seek at the midpoint.
+    """
+    thumb_path = f"{local_path}_thumb.jpg"
+    try:
+        dur_val = float(duration or 0)
+        if dur_val <= 0:
+            probed_dur, _, _ = await probe_video_metadata(local_path, user_id=user_id)
+            dur_val = float(probed_dur)
+
+        # Primary target: exact middle of the video (50% mark)
+        if dur_val > 0:
+            mid_point = round(dur_val / 2.0, 2)
+            candidate_timestamps = [
+                f"{mid_point:.2f}",
+                f"{max(0.0, dur_val * 0.25):.2f}",
+                "0",
+            ]
+        else:
+            candidate_timestamps = ["3", "0"]
+
+        # Scale so both width and height fit within 320px (required by Telegram)
+        vf_scale = "scale='min(320,iw)':'min(320,ih)':force_original_aspect_ratio=decrease"
+
+        for seek_ts in candidate_timestamps:
+            await _run_cmd_async(
+                [
+                    "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                    "-ss", seek_ts,
+                    "-i", local_path,
+                    "-frames:v", "1",
+                    "-vf", vf_scale,
+                    "-q:v", "3",
+                    "-threads", "1",
+                    thumb_path,
+                ],
+                user_id=user_id,
+                timeout=25.0,
+            )
+            if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
+                log.info(
+                    f"🖼 Midpoint thumbnail extracted at {seek_ts}s "
+                    f"(video duration={dur_val:.1f}s) for {os.path.basename(local_path)}"
+                )
+                return thumb_path
+    except Exception as e:
+        log.debug(f"Thumbnail extraction warning for {local_path}: {e}")
+    finally:
+        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) == 0:
+            try:
+                os.remove(thumb_path)
+            except OSError:
+                pass
+    return None
+
+
 async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) -> list[str]:
     size = os.path.getsize(local_path)
     if size <= SPLIT_SIZE:
@@ -1442,35 +1628,19 @@ async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) ->
     filename = os.path.basename(local_path)
     stem, extension = os.path.splitext(filename)
 
-    code, out, _ = await _run_cmd_async(
-        [
-            "ffprobe", "-hide_banner", "-loglevel", "error",
-            "-print_format", "json", "-show_format", local_path,
-        ],
-        user_id=user_id,
-        timeout=30.0,
-    )
-    duration = 0
-    if code == 0:
-        try:
-            fields = json.loads(out).get("format", {})
-            duration = round(float(fields.get("duration", 0)))
-        except Exception:
-            duration = 0
-
-    if duration == 0:
+    duration, _, _ = await probe_video_metadata(local_path, user_id=user_id)
+    if duration <= 0:
         return [local_path]
 
     split_size = SPLIT_SIZE - 3_000_000
     start_time = 0
     i = 1
-    parts = (size // SPLIT_SIZE) + 1
     multi_streams = True
     out_paths: list[str] = []
 
-    while i <= parts or start_time < duration - 4:
+    while start_time < duration - 4 and i <= 100:
         if cancel_flags.get(user_id) or force_kill_flags.get(user_id):
-            return out_paths or [local_path]
+            raise RuntimeError("Job cancelled during video split")
         out_path = str(split_dir_path / f"{stem}.part{i:03}{extension}")
 
         prefix = ["taskset", "-c", f"{cores}"] if cores != "0" else []
@@ -1491,7 +1661,7 @@ async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) ->
         ]
         rc, _, _ = await _run_cmd_async(prefix + head + maps + tail, user_id=user_id, timeout=600.0)
 
-        if rc != 0:
+        if rc != 0 or not os.path.exists(out_path):
             try:
                 os.remove(out_path)
             except OSError:
@@ -1505,35 +1675,33 @@ async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) ->
         if out_size > SPLIT_SIZE:
             new_split_size = split_size - (out_size - SPLIT_SIZE) - 5_000_000
             if new_split_size < 50_000_000:
-                os.remove(out_path)
+                try:
+                    os.remove(out_path)
+                except OSError:
+                    pass
                 return [local_path]
             split_size = new_split_size
-            os.remove(out_path)
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
             continue
 
-        rc2, out2, _ = await _run_cmd_async(
-            [
-                "ffprobe", "-hide_banner", "-loglevel", "error",
-                "-print_format", "json", "-show_format", out_path,
-            ],
-            user_id=user_id,
-            timeout=30.0,
-        )
-        lpd = 0
-        if rc2 == 0:
+        lpd, _, _ = await probe_video_metadata(out_path, user_id=user_id)
+        if lpd <= 0:
             try:
-                fields2 = json.loads(out2).get("format", {})
-                lpd = round(float(fields2.get("duration", 0)))
-            except Exception:
-                lpd = 0
-
-        if lpd == 0:
+                os.remove(out_path)
+            except OSError:
+                pass
             break
-        elif duration == lpd:
+        elif lpd >= duration:
             out_paths.append(out_path)
             break
         elif lpd <= 3:
-            os.remove(out_path)
+            try:
+                os.remove(out_path)
+            except OSError:
+                pass
             break
 
         out_paths.append(out_path)
@@ -1541,53 +1709,6 @@ async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) ->
         i += 1
 
     return out_paths or [local_path]
-
-
-async def generate_thumbnail(local_path: str, user_id: int = 0) -> str | None:
-    thumb_path = local_path + "_thumb.jpg"
-    try:
-        rc, stdout, _ = await _run_cmd_async(
-            [
-                "ffprobe", "-hide_banner", "-loglevel", "error",
-                "-print_format", "json", "-show_format", local_path,
-            ],
-            user_id=user_id,
-            timeout=15.0,
-        )
-        seek_time = 3
-        if rc == 0:
-            try:
-                duration = float(json.loads(stdout).get("format", {}).get("duration", 0))
-                if duration > 0:
-                    seek_time = max(1, int(duration / 2))
-            except Exception:
-                pass
-
-        await _run_cmd_async(
-            [
-                "ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
-                "-ss", str(seek_time),
-                "-i", local_path,
-                "-vf", "thumbnail,scale=320:-1",
-                "-q:v", "2",
-                "-frames:v", "1",
-                "-threads", "1",
-                thumb_path,
-            ],
-            user_id=user_id,
-            timeout=25.0,
-        )
-        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) > 0:
-            return thumb_path
-    except Exception:
-        pass
-    finally:
-        if os.path.exists(thumb_path) and os.path.getsize(thumb_path) == 0:
-            try:
-                os.remove(thumb_path)
-            except Exception:
-                pass
-    return None
 
 
 async def _send_with_retry(coro_fn, *args, max_retries: int = 5, **kwargs):
@@ -1735,6 +1856,9 @@ async def upload_part_with_progress(
     user_id: int,
     reply_to_message_id: int | None = None,
     board_state: "_BoardState | None" = None,
+    duration: int = 0,
+    width: int = 0,
+    height: int = 0,
 ) -> Message | None:
     loop = asyncio.get_running_loop()
     fname_disp = fname.split("/")[-1]
@@ -1775,35 +1899,52 @@ async def upload_part_with_progress(
 
     upload_start = [loop.time()]
     is_split = total_parts > 1
-    ext = os.path.basename(part_path).rsplit(".", 1)[-1].lower()
+    ext = os.path.basename(part_path).rsplit(".", 1)[-1].lower() if "." in os.path.basename(part_path) else ""
 
     if mode == "video" and (ext in VIDEO_EXTS or is_split):
+        reply_kw = _build_reply_kwargs(app.send_video, reply_to_message_id)
+        thumb_kw = _build_thumb_kwargs(app.send_video, thumb)
+        video_meta_kw: dict[str, Any] = {}
+        if duration > 0:
+            video_meta_kw["duration"] = duration
+        if width > 0 and height > 0:
+            video_meta_kw["width"] = width
+            video_meta_kw["height"] = height
         return await _send_with_retry(
             app.send_video, DUMP_CHAT_ID, part_path,
-            caption=caption, supports_streaming=True, thumb=thumb,
-            reply_to_message_id=reply_to_message_id,
+            caption=caption, supports_streaming=True,
             progress=progress_handler,
+            **thumb_kw,
+            **video_meta_kw,
+            **reply_kw,
         )
     elif ext in AUDIO_EXTS and mode != "document":
+        reply_kw = _build_reply_kwargs(app.send_audio, reply_to_message_id)
+        thumb_kw = _build_thumb_kwargs(app.send_audio, thumb)
         return await _send_with_retry(
             app.send_audio, DUMP_CHAT_ID, part_path,
-            caption=caption, thumb=thumb,
-            reply_to_message_id=reply_to_message_id,
+            caption=caption,
             progress=progress_handler,
+            **thumb_kw,
+            **reply_kw,
         )
     elif ext in IMAGE_EXTS and mode != "document":
+        reply_kw = _build_reply_kwargs(app.send_photo, reply_to_message_id)
         return await _send_with_retry(
             app.send_photo, DUMP_CHAT_ID, part_path,
             caption=caption,
-            reply_to_message_id=reply_to_message_id,
             progress=progress_handler,
+            **reply_kw,
         )
     else:
+        reply_kw = _build_reply_kwargs(app.send_document, reply_to_message_id)
+        thumb_kw = _build_thumb_kwargs(app.send_document, thumb)
         return await _send_with_retry(
             app.send_document, DUMP_CHAT_ID, part_path,
-            caption=caption, thumb=thumb,
-            reply_to_message_id=reply_to_message_id,
+            caption=caption,
             progress=progress_handler,
+            **thumb_kw,
+            **reply_kw,
         )
 
 
@@ -1831,7 +1972,6 @@ async def process_one_file(
         file_dir = os.path.join(DOWNLOAD_DIR, f"job_{user_id}_{idx}")
         Path(file_dir).mkdir(parents=True, exist_ok=True)
         ext = fname.rsplit(".", 1)[-1].lower() if "." in fname else ""
-        thumb_path = None
         split_dir_cleanup: str | None = None
 
         dl_start = time.monotonic()
@@ -1899,33 +2039,28 @@ async def process_one_file(
 
         needs_split = file_size > SPLIT_SIZE
 
-        if ext in VIDEO_EXTS:
-            progress_map[idx] = f"╭─ 🖼 `[{idx}/{total}]` `{fname_display}`\n╰ 🎨 _Extracting video thumbnail…_"
-            await _push_board(status_msg, total, job_concurrent, progress_map, board_state, user_id)
-            thumb_path = await generate_thumbnail(local_path, user_id=user_id)
-
-        if needs_split:
-            progress_map[idx] = (
-                f"╭─ ✂️ `[{idx}/{total}]` `{fname_display}`\n"
-                f"╰ 🔄 _Splitting `{fmt_size(file_size)}` into <2GB parts…_"
-            )
-            await _push_board(status_msg, total, job_concurrent, progress_map, board_state, user_id)
-            split_dir = local_path + "_parts"
-            split_dir_cleanup = split_dir
-            parts = await split_file_async(local_path, split_dir, user_id=user_id)
-            if local_path not in parts:
-                try:
-                    os.remove(local_path)
-                except OSError:
-                    pass
-        else:
-            parts = [local_path]
-
-        total_parts = len(parts)
-
         try:
+            if needs_split:
+                progress_map[idx] = (
+                    f"╭─ ✂️ `[{idx}/{total}]` `{fname_display}`\n"
+                    f"╰ 🔄 _Splitting `{fmt_size(file_size)}` into <2GB parts…_"
+                )
+                await _push_board(status_msg, total, job_concurrent, progress_map, board_state, user_id)
+                split_dir = local_path + "_parts"
+                split_dir_cleanup = split_dir
+                parts = await split_file_async(local_path, split_dir, user_id=user_id)
+                if local_path not in parts:
+                    try:
+                        os.remove(local_path)
+                    except OSError:
+                        pass
+            else:
+                parts = [local_path]
+
+            total_parts = len(parts)
             prev_msg_id: int | None = None
             all_parts_sent = True
+
             for part_idx, part_path in enumerate(parts, 1):
                 if force_kill_flags.get(user_id):
                     raise RuntimeError("Job aborted by user")
@@ -1946,23 +2081,50 @@ async def process_one_file(
                 else:
                     caption = f"📁 `{fname_only}` · `{fmt_size(file_size)}`"
 
-                sent = await upload_part_with_progress(
-                    part_path=part_path,
-                    caption=caption,
-                    mode=mode,
-                    thumb=thumb_path,
-                    idx=idx,
-                    total_files=total,
-                    fname=fname,
-                    part_idx=part_idx,
-                    total_parts=total_parts,
-                    file_size=part_size,
-                    progress_map=progress_map,
-                    status_msg=status_msg,
-                    user_id=user_id,
-                    reply_to_message_id=prev_msg_id,
-                    board_state=board_state,
-                )
+                part_thumb: str | None = None
+                part_dur, part_w, part_h = 0, 0, 0
+                if ext in VIDEO_EXTS:
+                    progress_map[idx] = (
+                        f"╭─ 🖼 `[{idx}/{total}]` `{fname_display}`\n"
+                        f"╰ 🎨 _Extracting midpoint thumbnail"
+                        + (f" (part {part_idx}/{total_parts})…_" if total_parts > 1 else "…_")
+                    )
+                    await _push_board(status_msg, total, job_concurrent, progress_map, board_state, user_id)
+                    part_dur, part_w, part_h = await probe_video_metadata(part_path, user_id=user_id)
+                    part_thumb = await generate_thumbnail(
+                        part_path,
+                        user_id=user_id,
+                        duration=part_dur,
+                    )
+
+                try:
+                    sent = await upload_part_with_progress(
+                        part_path=part_path,
+                        caption=caption,
+                        mode=mode,
+                        thumb=part_thumb,
+                        idx=idx,
+                        total_files=total,
+                        fname=fname,
+                        part_idx=part_idx,
+                        total_parts=total_parts,
+                        file_size=part_size,
+                        progress_map=progress_map,
+                        status_msg=status_msg,
+                        user_id=user_id,
+                        reply_to_message_id=prev_msg_id,
+                        board_state=board_state,
+                        duration=part_dur,
+                        width=part_w,
+                        height=part_h,
+                    )
+                finally:
+                    if part_thumb and os.path.exists(part_thumb):
+                        try:
+                            os.remove(part_thumb)
+                        except OSError:
+                            pass
+
                 if sent:
                     prev_msg_id = sent.id
                     try:
@@ -2002,8 +2164,8 @@ async def process_one_file(
                 board_state.mark_dirty()
 
         except Exception as e:
-            log.error(f"[{idx}/{total}] Upload failed: {fname} — {e}")
-            progress_map[idx] = f"❌ `[{idx}/{total}]` UL failed: `{fname_display}`\n    `{str(e)[:80]}`"
+            log.error(f"[{idx}/{total}] Transfer failed: {fname} — {e}")
+            progress_map[idx] = f"❌ `[{idx}/{total}]` Failed: `{fname_display}`\n    `{str(e)[:80]}`"
             results["failed"].append(fname)
             with stats_lock:
                 stats["total_failed"] += 1
@@ -2013,11 +2175,6 @@ async def process_one_file(
         finally:
             if split_dir_cleanup:
                 shutil.rmtree(split_dir_cleanup, ignore_errors=True)
-            if thumb_path and os.path.exists(thumb_path):
-                try:
-                    os.remove(thumb_path)
-                except OSError:
-                    pass
             shutil.rmtree(file_dir, ignore_errors=True)
 
 
@@ -2118,7 +2275,14 @@ async def _run_job(
                 _rpx, _rpp = _rp.split(":", 1)
                 _rpp = _rpp.lstrip("/")
                 _rp = f"{_rpx}:{_rpp}" if _rpp else f"{_rpx}:"
-            if total == 1 and not remote_path.endswith("/"):
+            # If the user passed a direct single-file remote path (e.g. "gdrive:folder/video.mp4"),
+            # `rclone lsf` returns `fname = "video.mp4"`. Avoid duplicating the filename in that case,
+            # while still appending `/fname` when `remote_path` is a folder that happens to hold 1 file.
+            if (
+                total == 1
+                and not remote_path.endswith("/")
+                and (_rp.endswith("/" + fname) or _rp.endswith(":" + fname))
+            ):
                 full_remote = _rp
             elif _rp.endswith(":"):
                 full_remote = _rp + fname
@@ -2136,7 +2300,6 @@ async def _run_job(
         with stats_lock:
             stats["current_files"] = []
 
-    # Clear active job checkpoint if completed or user explicitly cancelled
     if not was_cancelled or len(results["done_files"]) + len(results["failed"]) + len(results["skipped"]) >= total:
         await db_mgr.clear_active_job()
 
@@ -2214,7 +2377,6 @@ async def _send_summary(status_msg: Message, results: dict) -> None:
 
 
 async def _resume_saved_job(saved_job: dict[str, Any], notify_chat_id: int | None = None) -> None:
-    """Resume an unfinished transfer job from MongoDB checkpoint."""
     remote_path = saved_job.get("remote_path", "")
     mode = saved_job.get("mode", DEFAULT_UPLOAD_MODE)
     do_delete = bool(saved_job.get("do_delete", False))
@@ -3192,7 +3354,7 @@ async def _async_main():
             pass
 
     threading.Thread(target=_run_health, daemon=True).start()
-    log.info(f"Health check server listening on port {HEALTH_PORT}")
+    log.info(f"Health check server listening on port {HEALTH_PORT} ({MTPROTO_ENGINE})")
 
     # 1. Connect to MongoDB & restore all settings, stats, and rclone.conf
     await db_mgr.connect()
@@ -3204,7 +3366,7 @@ async def _async_main():
     await register_bot_commands_auto()
 
     me = await app.get_me()
-    log.info(f"🚀 Bot @{me.username} (ID: {me.id}) is online!")
+    log.info(f"🚀 Bot @{me.username} (ID: {me.id}) online via {MTPROTO_ENGINE}!")
 
     # 4. If restarted via /restart or button, update the restart message
     marker = await db_mgr.pop_restart_marker()

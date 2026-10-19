@@ -3,8 +3,11 @@
 # ── Stage 1: Fetch static rclone binary ───────────────────────────────
 FROM rclone/rclone:latest AS rclone_bin
 
-# ── Stage 2: Build Python wheels (keeps gcc/build-deps out of runtime) ─
+# ── Stage 2: Build Python wheels (supports wzgram or kurigram[fast]) ──
 FROM python:3.11-slim-bookworm AS builder
+
+# Choose MTProto library at build time: "wzgram" (default) or "kurigram[fast]"
+ARG MTPROTO_LIB="wzgram"
 
 ENV PIP_NO_CACHE_DIR=1 \
     PIP_DISABLE_PIP_VERSION_CHECK=1 \
@@ -18,7 +21,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /build
 COPY requirements.txt .
-RUN pip install --prefix=/install --no-warn-script-location -r requirements.txt
+RUN grep -vE '^(wzgram|kurigram)' requirements.txt > /tmp/base_reqs.txt \
+    && pip install --prefix=/install --no-warn-script-location "${MTPROTO_LIB}" -r /tmp/base_reqs.txt
 
 # ── Stage 3: Minimal, lightweight production runtime ──────────────────
 FROM python:3.11-slim-bookworm
