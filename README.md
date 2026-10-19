@@ -1,23 +1,22 @@
-# ☁️ Rclone ➔ Telegram Transfer Bot (WZGram + MongoDB)
+# ☁️ Rclone ➔ Telegram Transfer Bot (WZGram + MongoDB Edition)
 
-High-speed, lightweight cloud-to-Telegram media transfer bot powered by **[WZGram](https://wzgram.com/)** (Rust `WarpCrypto`), **Rclone**, **FFmpeg**, and **Async Motor MongoDB**.
+High-speed, pipelined Rclone-to-Telegram transfer bot powered by **WZGram** (Rust `WarpCrypto`) and **Motor MongoDB** where **100% of all configuration, remotes, file browsing, speed tuning, and job controls are managed directly inside the Telegram Bot UI**.
 
-## ✨ Key Features
-- **Pure WZGram Engine**: Built exclusively on `wzgram` with Rust-accelerated `WarpCrypto` for maximum MTProto upload throughput.
-- **Full MongoDB Persistence & Auto-Resume**:
-  - Automatically persists all settings, **Concurrency Setup** (`CONCURRENT_JOBS`, `RCLONE_STREAMS`, `RCLONE_BUFFER_SIZE`), `rclone.conf`, authorized users, and transfer statistics in MongoDB.
-  - Checkpoints active transfer jobs after every file and automatically resumes unfinished jobs on container/bot restart.
-- **Dedicated Concurrency & Streams Setup UI (`/concurrent`)**:
-  - Interactive 1-tap buttons for Parallel Jobs (`1x`–`5x`), Rclone Multi-Thread Streams (`2`–`16`), and Rclone Buffer Size (`16M`–`128M`), synced live to WZGram's `max_concurrent_transmissions` and saved in MongoDB.
-- **Midpoint Video Thumbnails & Metadata**:
-  - Automatically probes video `(duration, width, height)` via `ffprobe` and extracts a `<= 320×320` JPEG thumbnail from the exact middle (`duration / 2`) of every video and split part.
-- **Auto-Registered Bot Commands**:
-  - Automatically registers all slash commands across Default, Private Chat, and Group Chat scopes on startup.
+---
 
-## 🚀 Quick Start (Docker)
-1. Copy `config.env.example` to `config.env` and fill in `API_ID`, `API_HASH`, `BOT_TOKEN`, `OWNER_ID`, `DUMP_CHAT_ID`, and `MONGO_URI`.
-2. Build and launch:
-   ```bash
-   docker compose up -d --build
-   ```
-3. Send `/start` to your bot in Telegram, upload your `rclone.conf` via **🔧 Upload rclone.conf**, and browse your remotes with **🗂 Browse Remotes**!
+## ✨ Key Features (100% Controlled from Bot)
+
+1. **🎯 File Types Filter (`Videos`, `Images`, `Documents`)**
+   - Switch between **🎬 Videos Only**, **🖼 Images Only**, **📄 Documents Only**, **🎞 Video + Image**, or **📦 All Types** with 1 tap, or toggle individual categories on/off.
+2. **🗂 Interactive Remote, Folder & Single-File Browser**
+   - Browse all configured Rclone remotes (`☁️`), navigate into subfolders (`📁`), or tap **📄 View Files** to inspect individual files with sizes and transfer or delete any single file with 1 tap.
+3. **⚡ Live Speed & Concurrency Tuning**
+   - Switch between **🛡 Safe (`1x · 2w · 4s`)**, **⚡ Fast (`2x · 4w · 8s`)**, and **🚀 Turbo (`3x · 6w · 16s`)** presets, or tune **Parallel Jobs (`1x–5x`)**, **Upload Workers (`2w–8w`)**, **Rclone Streams (`4s–16s`)**, and **Buffer Size (`32M–256M`)** directly from inline buttons.
+4. **📢 Interactive Dump Chat / Channel Manager**
+   - Change the upload destination anytime from the bot: tap **📍 Use This Chat**, **👤 Use Owner DM**, **🔔 Test Upload Chat**, or **✏️ Enter ID / Forward Msg** (forward any message from your target channel to set it automatically).
+5. **🔧 Full `rclone.conf` Manager inside Telegram**
+   - Upload a `.conf` document, **paste `[remote]` config text directly in chat**, download your active `rclone.conf` for backup, or delete individual remotes with 1 tap.
+6. **⚙️ Complete Control Panel in Telegram**
+   - Toggle **Auto-Delete Remote**, **Auto-Resume Jobs**, **Default Upload Mode (`Media` vs `Document`)**, **Max File Size Cap** (presets + custom MB prompt), **Split Threshold (`500M–2000M`)**, **Bandwidth Limit**, **Rclone Extra Flags** (1-tap popular flags + custom input), and **Authorized Users** (`➕ Add` / `🗑 Remove` buttons).
+7. **🗄 MongoDB Persistence + Auto-Resume**
+   - All settings, `rclone.conf`, transfer statistics, and active job progress checkpoints are synced to MongoDB (with automatic local JSON fallback) so interrupted transfers resume seamlessly after a restart.

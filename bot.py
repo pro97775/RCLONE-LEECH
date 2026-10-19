@@ -1,6 +1,22 @@
 # ==============================================================================
-#  Rclone ➔ Telegram Transfer Bot
+#  Rclone ➔ Telegram Transfer Bot (100% Bot-Controlled Edition)
 #  Engine: WZGram (Rust WarpCrypto) + Pipelined Rclone/MTProto + Motor MongoDB
+# ==============================================================================
+#  Step-by-Step Architecture:
+#    Step  1: Bootstrap, uvloop Event Loop & WZGram Engine Loader
+#    Step  2: Logging, FloodWait Log Coalescer & Ring Buffer
+#    Step  3: Environment Loader, rclone.conf Bootstrap & File-Type Classifier
+#    Step  4: Runtime State, Interactive Prompt State & Zero-Overhead Flood Guard
+#    Step  5: MongoDB Persistence Engine (with Local JSON Fallback)
+#    Step  6: Health Check HTTP Server & Graceful Shutdown/Restart Cleanup
+#    Step  7: Clean UI Formatters & Visual Progress Components
+#    Step  8: Bot Control Center Keyboards & Screen Builders (100% Bot Control)
+#    Step  9: High-Speed Async Subprocess Engine (rclone / ffmpeg / ffprobe)
+#    Step 10: Live Transfer Progress Board (_BoardState)
+#    Step 11: Pipelined Transfer Engine (Parallel Download + Upload Semaphores)
+#    Step 12: Interactive Remote, Folder & Single-File Browser
+#    Step 13: Command Handlers, Interactive Input Handler & Callback Router
+#    Step 14: Startup Lifecycle, Auto Command Registration & Auto-Resume Hook
 # ==============================================================================
 
 import os
@@ -21,7 +37,9 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from typing import Any
 
-# ── 1. Bootstrap, Event Loop (uvloop) & WZGram Engine Loader ─────────────────
+# ==============================================================================
+#  STEP 1: Bootstrap, uvloop Event Loop & WZGram Engine Loader
+# ==============================================================================
 try:
     import uvloop
     uvloop.install()
@@ -114,7 +132,7 @@ def _normalize_remote_path(remote_path: str) -> str:
 
 def _remote_basename(path_str: str, is_remote: bool = False) -> str:
     """
-    Safely extract the filename from a path WITHOUT stripping colons that belong
+    Extract the filename from a path without stripping colons that belong
     to the filename itself (e.g. `Movie: Part 1.mp4`).
     """
     s = path_str.strip().rstrip("/")
@@ -128,15 +146,32 @@ def _remote_basename(path_str: str, is_remote: bool = False) -> str:
 
 
 def _rclone_extra_flags() -> list[str]:
-    if not RCLONE_FLAGS:
+    with state_lock:
+        raw = RCLONE_FLAGS
+    if not raw:
         return []
     try:
-        return shlex.split(RCLONE_FLAGS)
+        return shlex.split(raw)
     except ValueError:
-        return RCLONE_FLAGS.split()
+        return raw.split()
 
 
-# ── 2. Logging, Noise Suppression & Deduplicating Ring Buffer ────────────────
+def _extract_forwarded_chat_id(msg: Message) -> int | None:
+    """Extract source channel/supergroup ID from a forwarded message across all Bot API / MTProto layers."""
+    f_chat = getattr(msg, "forward_from_chat", None)
+    if f_chat and getattr(f_chat, "id", None) is not None:
+        return int(f_chat.id)
+    f_origin = getattr(msg, "forward_origin", None)
+    if f_origin:
+        o_chat = getattr(f_origin, "chat", None) or getattr(f_origin, "sender_chat", None)
+        if o_chat and getattr(o_chat, "id", None) is not None:
+            return int(o_chat.id)
+    return None
+
+
+# ==============================================================================
+#  STEP 2: Logging, FloodWait Log Coalescer & Ring Buffer
+# ==============================================================================
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -162,8 +197,6 @@ class _WzgramFloodDedupFilter(logging.Filter):
     """
     Coalesces WZGram's internal `Retrying upload part ... FLOOD_WAIT_X` warnings
     and notifies `_flood_guard` once per record so parallel chunk workers stagger.
-    Caches the decision on `record._flood_decision` so multiple handlers never
-    double-count or accidentally suppress the initial warning.
     """
 
     def __init__(self) -> None:
@@ -216,7 +249,9 @@ _bh.addFilter(_dedup_filter)
 logging.getLogger().addHandler(_bh)
 
 
-# ── 3. Environment, File-Type Definitions & Static Configuration ─────────────
+# ==============================================================================
+#  STEP 3: Environment Loader, rclone.conf Bootstrap & File-Type Classifier
+# ==============================================================================
 def _load_env_file(path: str = "config.env") -> None:
     p = Path(path)
     if not p.exists():
@@ -235,9 +270,34 @@ def _load_env_file(path: str = "config.env") -> None:
 
 _load_env_file("config.env")
 
-RCLONE_CONF_PATH = Path(
-    os.environ.get("RCLONE_CONFIG", "/root/.config/rclone/rclone.conf")
-)
+def _resolve_rclone_conf_path() -> Path:
+    candidates = []
+    env_p = os.environ.get("RCLONE_CONFIG", "").strip()
+    if env_p:
+        candidates.append(Path(env_p))
+    candidates.append(Path.home() / ".config" / "rclone" / "rclone.conf")
+    candidates.append(Path("/tmp/rclone.conf"))
+    for cand in candidates:
+        try:
+            cand.parent.mkdir(parents=True, exist_ok=True)
+            if os.access(cand.parent, os.W_OK):
+                os.environ["RCLONE_CONFIG"] = str(cand)
+                return cand
+        except OSError:
+            continue
+    fallback = Path("/tmp/rclone.conf")
+    os.environ["RCLONE_CONFIG"] = str(fallback)
+    return fallback
+
+
+def _safe_conf_exists() -> bool:
+    try:
+        return os.path.isfile(RCLONE_CONF_PATH)
+    except OSError:
+        return False
+
+
+RCLONE_CONF_PATH = _resolve_rclone_conf_path()
 
 
 def _write_initial_rclone_conf() -> str | None:
@@ -271,7 +331,7 @@ def _write_initial_rclone_conf() -> str | None:
         except Exception as e:
             log.error(f"Failed to write rclone.conf: {e}")
 
-    if _target.exists():
+    if _safe_conf_exists():
         os.environ["RCLONE_CONFIG"] = str(_target)
         log.info(f"rclone.conf found at {_target}")
         try:
@@ -279,7 +339,7 @@ def _write_initial_rclone_conf() -> str | None:
         except Exception:
             return None
 
-    log.info("No local rclone.conf yet — will check MongoDB on startup or await /setrclone.")
+    log.info("No local rclone.conf yet — will check MongoDB on startup or await /setrclone in bot.")
     return None
 
 
@@ -299,7 +359,6 @@ _API_ID = _req("API_ID")
 API_HASH = _req("API_HASH")
 BOT_TOKEN = _req("BOT_TOKEN")
 _OWNER = _req("OWNER_ID")
-_DUMP = _req("DUMP_CHAT_ID")
 
 if _MISSING:
     for k in _MISSING:
@@ -308,7 +367,9 @@ if _MISSING:
 
 API_ID = int(_API_ID)
 OWNER_ID = int(_OWNER)
-DUMP_CHAT_ID = int(_DUMP)
+# DUMP_CHAT_ID defaults to OWNER_ID if not set in env, and is 100% changeable from the bot UI
+_DUMP_RAW = os.environ.get("DUMP_CHAT_ID", "").strip()
+DUMP_CHAT_ID = int(_DUMP_RAW) if _DUMP_RAW else OWNER_ID
 
 AUTHORIZED_USERS: set[int] = {OWNER_ID}
 for _uid in os.environ.get("AUTHORIZED_USERS", "").replace(";", ",").split(","):
@@ -334,7 +395,6 @@ RCLONE_STREAMS = max(1, min(32, int(os.environ.get("RCLONE_STREAMS", "8") or 8))
 SPLIT_SIZE = int(os.environ.get("SPLIT_SIZE", str(2000 * 1024 * 1024)))
 HEALTH_PORT = int(os.environ.get("PORT") or os.environ.get("HEALTH_PORT") or 8080)
 CONCURRENT_JOBS = max(1, min(5, int(os.environ.get("CONCURRENT_JOBS", 2) or 2)))
-# 4 parallel SaveBigFilePart workers per file avoids DC4 session flood while saturating bandwidth
 UPLOAD_WORKERS = max(1, min(16, int(os.environ.get("UPLOAD_WORKERS", 4) or 4)))
 BW_LIMIT = os.environ.get("BW_LIMIT", "").strip()
 STATS_FILE = os.environ.get("STATS_FILE", "/tmp/rclone_bot_stats.json").strip()
@@ -470,13 +530,17 @@ def _fmt_file_types_short(ft_set: set[str] | None = None) -> str:
     return "+".join(names)
 
 
-# ── 4. Runtime State, FloodWait Guard & Short-ID Registry ────────────────────
+# ==============================================================================
+#  STEP 4: Runtime State, Interactive Prompt State & Zero-Overhead Flood Guard
+# ==============================================================================
 BOT_START_TIME = time.time()
 active_sessions: set[int] = set()
 cancel_flags: dict[int, bool] = {}
 force_kill_flags: dict[int, bool] = {}
 upload_mode: dict[int, str] = {}
-awaiting_rclone_conf: set[int] = set()
+# Unified interactive prompt state per user:
+# awaiting_input[user_id] = {"kind": "...", "cancel_nav": "nav:..."}
+awaiting_input: dict[int, dict[str, Any]] = {}
 active_procs: dict[int, set[asyncio.subprocess.Process]] = collections.defaultdict(set)
 active_boards: dict[int, "_BoardState"] = {}
 _health_server: HTTPServer | None = None
@@ -505,16 +569,22 @@ stats: dict[str, Any] = {
 stats_lock = threading.Lock()
 
 _path_registry: collections.OrderedDict[str, str] = collections.OrderedDict()
+_single_file_keys: set[str] = set()
 _MAX_PATH_REGISTRY = 512
 
 
-def _reg_path(remote_path: str) -> str:
+def _reg_path(remote_path: str, is_single_file: bool | None = None) -> str:
     key = hashlib.blake2s(remote_path.encode("utf-8"), digest_size=5).hexdigest()
     with state_lock:
         _path_registry[key] = remote_path
         _path_registry.move_to_end(key)
+        if is_single_file is True:
+            _single_file_keys.add(key)
+        elif is_single_file is False:
+            _single_file_keys.discard(key)
         while len(_path_registry) > _MAX_PATH_REGISTRY:
-            _path_registry.popitem(last=False)
+            old_k, _ = _path_registry.popitem(last=False)
+            _single_file_keys.discard(old_k)
     return key
 
 
@@ -523,12 +593,33 @@ def _get_path(key: str) -> str | None:
         return _path_registry.get(key)
 
 
+def _is_single_file_key(key: str) -> bool:
+    with state_lock:
+        return key in _single_file_keys
+
+
+def _has_active_session() -> bool:
+    with state_lock:
+        return bool(active_sessions)
+
+
 def is_authorized(user_id: int) -> bool:
     with state_lock:
         return user_id in AUTHORIZED_USERS
 
 
 auth_filter = filters.create(lambda _, __, m: bool(m.from_user and is_authorized(m.from_user.id)))
+
+# Matches any non-command, non-document message when the user is in an interactive prompt
+interactive_input_filter = filters.create(
+    lambda _, __, m: bool(
+        m.from_user
+        and is_authorized(m.from_user.id)
+        and m.from_user.id in awaiting_input
+        and not getattr(m, "document", None)
+        and not ((getattr(m, "text", None) or "").startswith("/"))
+    )
+)
 
 app = Client(
     "rclone_bot",
@@ -677,7 +768,9 @@ def _sync_client_concurrency() -> None:
         pass
 
 
-# ── 5. MongoDB Persistence Engine (with Local JSON Fallback) ──────────────────
+# ==============================================================================
+#  STEP 5: MongoDB Persistence Engine (with Local JSON Fallback)
+# ==============================================================================
 class DatabaseManager:
     def __init__(self, uri: str, db_name: str, fallback_file: str):
         self.uri = uri
@@ -711,7 +804,6 @@ class DatabaseManager:
             self.last_sync_ts = time.time()
             log.info(f"✅ Connected to MongoDB database: '{self.db_name}'")
             await self.load_all()
-            # Only seed rclone.conf from startup env if MongoDB doesn't already hold a user-uploaded config
             if _INITIAL_RCLONE_TEXT and not self._has_db_rclone_conf:
                 await self.save_rclone_conf(_INITIAL_RCLONE_TEXT, source="startup_env")
             return True
@@ -725,6 +817,7 @@ class DatabaseManager:
     def _snapshot_settings(self) -> dict[str, Any]:
         with state_lock:
             recent_paths = dict(list(_path_registry.items())[-100:])
+            single_keys = [k for k in recent_paths if k in _single_file_keys]
             return {
                 "delete_after_upload": delete_after_upload,
                 "max_size_enabled": max_size_enabled,
@@ -735,6 +828,7 @@ class DatabaseManager:
                 "rclone_streams": RCLONE_STREAMS,
                 "rclone_buffer_size": RCLONE_BUFFER_SIZE,
                 "bw_limit": BW_LIMIT,
+                "rclone_flags": RCLONE_FLAGS,
                 "board_refresh_interval": BOARD_REFRESH_INTERVAL,
                 "split_size": SPLIT_SIZE,
                 "default_upload_mode": DEFAULT_UPLOAD_MODE,
@@ -742,6 +836,7 @@ class DatabaseManager:
                 "authorized_users": sorted(AUTHORIZED_USERS),
                 "DUMP_CHAT_ID": DUMP_CHAT_ID,
                 "path_registry": recent_paths,
+                "single_file_keys": single_keys,
                 "speed_profile_v3": True,
                 "updated_at": time.time(),
             }
@@ -760,7 +855,7 @@ class DatabaseManager:
     def _apply_settings(self, cfg: dict[str, Any]) -> None:
         global delete_after_upload, max_size_enabled, max_size_bytes, enabled_file_types
         global CONCURRENT_JOBS, UPLOAD_WORKERS, RCLONE_STREAMS, RCLONE_BUFFER_SIZE
-        global BW_LIMIT, BOARD_REFRESH_INTERVAL
+        global BW_LIMIT, RCLONE_FLAGS, BOARD_REFRESH_INTERVAL
         global SPLIT_SIZE, DEFAULT_UPLOAD_MODE, AUTO_RESUME_JOBS, DUMP_CHAT_ID
 
         is_v3 = bool(cfg.get("speed_profile_v3"))
@@ -795,6 +890,8 @@ class DatabaseManager:
 
             if isinstance(cfg.get("bw_limit"), str):
                 BW_LIMIT = cfg["bw_limit"]
+            if isinstance(cfg.get("rclone_flags"), str):
+                RCLONE_FLAGS = cfg["rclone_flags"].strip()
             if isinstance(cfg.get("board_refresh_interval"), (int, float)):
                 BOARD_REFRESH_INTERVAL = max(2.0, min(30.0, float(cfg["board_refresh_interval"])))
             if isinstance(cfg.get("split_size"), int) and cfg["split_size"] > 50_000_000:
@@ -804,6 +901,8 @@ class DatabaseManager:
             if isinstance(cfg.get("auto_resume_jobs"), bool):
                 AUTO_RESUME_JOBS = cfg["auto_resume_jobs"]
             if isinstance(cfg.get("authorized_users"), list):
+                AUTHORIZED_USERS.clear()
+                AUTHORIZED_USERS.add(OWNER_ID)
                 for uid in cfg["authorized_users"]:
                     if isinstance(uid, int):
                         AUTHORIZED_USERS.add(uid)
@@ -813,6 +912,10 @@ class DatabaseManager:
                 for k, v in cfg["path_registry"].items():
                     if isinstance(k, str) and isinstance(v, str):
                         _path_registry[k] = v
+            if isinstance(cfg.get("single_file_keys"), list):
+                for k in cfg["single_file_keys"]:
+                    if isinstance(k, str):
+                        _single_file_keys.add(k)
         _sync_client_concurrency()
 
     def _apply_stats(self, data: dict[str, Any]) -> None:
@@ -858,7 +961,7 @@ class DatabaseManager:
                     f"Restored bot configuration from MongoDB "
                     f"(CONCURRENT_JOBS={CONCURRENT_JOBS}x, UPLOAD_WORKERS={UPLOAD_WORKERS}w, "
                     f"STREAMS={RCLONE_STREAMS}s, BUF={RCLONE_BUFFER_SIZE}, "
-                    f"TYPES={','.join(sorted(enabled_file_types))})"
+                    f"DUMP={DUMP_CHAT_ID}, TYPES={','.join(sorted(enabled_file_types))})"
                 )
                 if not was_v3:
                     await self.save_all()
@@ -871,12 +974,11 @@ class DatabaseManager:
             rc_doc = await self.db.bot_state.find_one({"_id": "rclone_conf"})
             if rc_doc and isinstance(rc_doc.get("content"), str) and rc_doc["content"].strip():
                 self._has_db_rclone_conf = True
-                if not RCLONE_CONF_PATH.exists() or rc_doc.get("source") in ("telegram_upload", "manual_sync"):
-                    RCLONE_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
-                    RCLONE_CONF_PATH.write_text(rc_doc["content"], encoding="utf-8")
-                    os.environ["RCLONE_CONFIG"] = str(RCLONE_CONF_PATH)
-                    remotes = re.findall(r"^\[([^\]]+)\]", rc_doc["content"], re.MULTILINE)
-                    log.info(f"Restored rclone.conf from MongoDB ({len(remotes)} remote(s))")
+                RCLONE_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+                RCLONE_CONF_PATH.write_text(rc_doc["content"], encoding="utf-8")
+                os.environ["RCLONE_CONFIG"] = str(RCLONE_CONF_PATH)
+                remotes = re.findall(r"^\[([^\]]+)\]", rc_doc["content"], re.MULTILINE)
+                log.info(f"Restored rclone.conf from MongoDB ({len(remotes)} remote(s))")
             self.last_sync_ts = time.time()
         except Exception as e:
             self.last_error = str(e)[:120]
@@ -1047,7 +1149,9 @@ class DatabaseManager:
 db_mgr = DatabaseManager(MONGO_URI, MONGO_DB_NAME, STATS_FILE)
 
 
-# ── 6. Health Check HTTP Server ───────────────────────────────────────────────
+# ==============================================================================
+#  STEP 6: Health Check HTTP Server & Graceful Shutdown/Restart Cleanup
+# ==============================================================================
 class _HealthHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/health", "/ping", "/"):
@@ -1063,11 +1167,14 @@ class _HealthHandler(BaseHTTPRequestHandler):
                 up_w = UPLOAD_WORKERS
                 streams = RCLONE_STREAMS
                 buf = RCLONE_BUFFER_SIZE
+                dump_id = DUMP_CHAT_ID
+                act_cnt = len(active_sessions)
                 ft_str = ",".join(sorted(enabled_file_types))
             body = (
                 f"status=ok\nengine={MTPROTO_ENGINE}\nuptime={h}h {m}m {s}s\n"
                 f"mongodb={'connected' if db_mgr.connected else 'local_fallback'}\n"
-                f"active_jobs={len(active_sessions)}\n"
+                f"dump_chat_id={dump_id}\n"
+                f"active_jobs={act_cnt}\n"
                 f"concurrent_limit={conc}\n"
                 f"upload_workers={up_w}\n"
                 f"rclone_streams={streams}\n"
@@ -1115,7 +1222,9 @@ async def _graceful_restart_cleanup() -> None:
         pass
 
 
-# ── 7. Clean UI Formatters & Visual Components ────────────────────────────────
+# ==============================================================================
+#  STEP 7: Clean UI Formatters & Visual Progress Components
+# ==============================================================================
 def fmt_size(size_bytes: float) -> str:
     if size_bytes < 0:
         return "0.0 B"
@@ -1205,26 +1314,66 @@ def make_progress_line(
     return f"{label}{part_tag}\n" + " · ".join(meta)
 
 
-# ── 8. Clean & Simple Keyboards and UI Screens ────────────────────────────────
+# ==============================================================================
+#  STEP 8: Bot Control Center Keyboards & Screen Builders (100% Bot Control)
+# ==============================================================================
 _CONC_OPTIONS = [1, 2, 3, 4, 5]
 _UP_WORKER_OPTIONS = [2, 4, 6, 8]
 _STREAM_OPTIONS = [4, 8, 12, 16]
 _BUFFER_OPTIONS = ["32M", "64M", "128M", "256M"]
 _SIZE_PRESETS_MB = [250, 500, 1024, 2000, 4000]
+_SPLIT_PRESETS_MB = [500, 1000, 1500, 1950, 2000]
 _BW_PRESETS = ["", "5M", "10M", "25M", "50M", "100M"]
 _REFRESH_PRESETS = [3.0, 5.0, 8.0, 12.0, 15.0]
+_POPULAR_FLAGS = [
+    ("--fast-list", "⚡ Fast-List"),
+    ("--drive-acknowledge-abuse", "🛡 GDrive Abuse OK"),
+    ("--no-check-certificate", "🔓 No Cert Check"),
+    ("--ignore-checksum", "⏩ Ignore Checksum"),
+]
+
+
+def _resolve_return_button(return_tag: str) -> tuple[str, str]:
+    """
+    Resolve a compact `return_tag` into `(button_label, callback_data)` so
+    sub-menus (`File Types`, `Speed & Concurrency`) always return to the exact
+    screen that opened them:
+      • `d_<key>` ➔ Folder Transfer Launchpad (`dl:open:<key>`)
+      • `s_<key>` ➔ Single-File Transfer Launchpad (`dl:file:<key>`)
+      • `f_<key>` ➔ Files in Folder Browser (`br:files:<key>:0`)
+      • `b_<key>` ➔ Remote Folder Browser (`br:dir:<key>:0`)
+      • `r_0`     ➔ Remotes List (`nav:remotes:0`)
+      • `home`    ➔ Home Menu (`nav:home`)
+      • `""`      ➔ Control Panel (`nav:settings`)
+    """
+    if not return_tag:
+        return ("⬅️ Control Panel", "nav:settings")
+    if return_tag == "home":
+        return ("⬅️ Home", "nav:home")
+    if return_tag == "r_0":
+        return ("⬅️ Remotes", "nav:remotes:0")
+    if return_tag.startswith("d_"):
+        return ("⬅️ Back to Transfer", f"dl:open:{return_tag[2:]}")
+    if return_tag.startswith("s_"):
+        return ("⬅️ Back to File", f"dl:file:{return_tag[2:]}")
+    if return_tag.startswith("f_"):
+        return ("⬅️ Back to Files", f"br:files:{return_tag[2:]}:0")
+    if return_tag.startswith("b_"):
+        return ("⬅️ Back to Folder", f"br:dir:{return_tag[2:]}:0")
+    return ("⬅️ Back to Transfer", f"dl:open:{return_tag}")
 
 
 def home_keyboard() -> InlineKeyboardMarkup:
-    """Simple, clean 2-column main menu keyboard."""
+    """Clean 2-column main menu keyboard giving full access to every bot control."""
     with state_lock:
         failed_cnt = len(last_failed)
         conc = CONCURRENT_JOBS
         up_w = UPLOAD_WORKERS
+        is_running = bool(active_sessions)
         ft_short = _fmt_file_types_short(enabled_file_types)
 
     rows = []
-    if active_sessions:
+    if is_running:
         rows.append([
             InlineKeyboardButton("📡 View Active Transfer", callback_data="nav:queue")
         ])
@@ -1236,15 +1385,15 @@ def home_keyboard() -> InlineKeyboardMarkup:
     rows += [
         [
             InlineKeyboardButton("🗂 Browse Remotes", callback_data="nav:remotes:0"),
-            InlineKeyboardButton("📊 Status", callback_data="nav:status"),
+            InlineKeyboardButton("📊 Status & Tools", callback_data="nav:status"),
         ],
         [
-            InlineKeyboardButton(f"🎯 Types: {ft_short}", callback_data="nav:filetypes"),
-            InlineKeyboardButton(f"⚡ Speed: {conc}x·{up_w}w", callback_data="nav:concurrent"),
+            InlineKeyboardButton(f"🎯 Types: {ft_short}", callback_data="nav:filetypes:home"),
+            InlineKeyboardButton(f"⚡ Speed: {conc}x·{up_w}w", callback_data="nav:concurrent:home"),
         ],
         [
-            InlineKeyboardButton("⚙️ Settings", callback_data="nav:settings"),
-            InlineKeyboardButton("🔧 rclone.conf", callback_data="nav:setrclone"),
+            InlineKeyboardButton("⚙️ Control Panel", callback_data="nav:settings"),
+            InlineKeyboardButton("🔧 rclone.conf", callback_data="nav:rclone"),
         ],
     ]
     return InlineKeyboardMarkup(rows)
@@ -1253,8 +1402,9 @@ def home_keyboard() -> InlineKeyboardMarkup:
 def status_keyboard() -> InlineKeyboardMarkup:
     with state_lock:
         failed_cnt = len(last_failed)
+        is_running = bool(active_sessions)
     rows = []
-    if active_sessions:
+    if is_running:
         rows.append([
             InlineKeyboardButton("🛑 Stop After Current", callback_data="job:cancel"),
             InlineKeyboardButton("⛔ Kill Now", callback_data="job:kill"),
@@ -1269,6 +1419,10 @@ def status_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗄 MongoDB", callback_data="nav:db"),
         ],
         [
+            InlineKeyboardButton("🧹 Clean Temp", callback_data="action:clean_temp"),
+            InlineKeyboardButton("🔄 Reset Stats", callback_data="action:reset_stats"),
+        ],
+        [
             InlineKeyboardButton("🔄 Refresh", callback_data="nav:status"),
             InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
         ],
@@ -1276,12 +1430,12 @@ def status_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(rows)
 
 
-def filetypes_keyboard(return_dl_key: str = "") -> InlineKeyboardMarkup:
-    """Clean, simple File Types selector keyboard."""
+def filetypes_keyboard(return_tag: str = "") -> InlineKeyboardMarkup:
+    """File Types selector keyboard (Videos, Images, Documents)."""
     with state_lock:
         ft = set(enabled_file_types)
 
-    suffix = f":{return_dl_key}" if return_dl_key else ""
+    suffix = f":{return_tag}" if return_tag else ""
 
     only_vid = (ft == {"video"})
     only_img = (ft == {"image"})
@@ -1293,8 +1447,7 @@ def filetypes_keyboard(return_dl_key: str = "") -> InlineKeyboardMarkup:
     img_on = "image" in ft
     doc_on = "document" in ft
 
-    back_cb = f"dl:open:{return_dl_key}" if return_dl_key else "nav:home"
-    back_lbl = "⬅️ Back to Transfer" if return_dl_key else "⬅️ Back"
+    back_lbl, back_cb = _resolve_return_button(return_tag)
 
     return InlineKeyboardMarkup([
         [
@@ -1318,15 +1471,15 @@ def filetypes_keyboard(return_dl_key: str = "") -> InlineKeyboardMarkup:
     ])
 
 
-def concurrent_keyboard(return_dl_key: str = "") -> InlineKeyboardMarkup:
-    """Clean Speed & Concurrency Setup Keyboard."""
+def concurrent_keyboard(return_tag: str = "") -> InlineKeyboardMarkup:
+    """Speed & Concurrency Setup Keyboard."""
     with state_lock:
         cur_conc = CONCURRENT_JOBS
         cur_upw = UPLOAD_WORKERS
         cur_streams = RCLONE_STREAMS
         cur_buf = RCLONE_BUFFER_SIZE
 
-    suffix = f":{return_dl_key}" if return_dl_key else ""
+    suffix = f":{return_tag}" if return_tag else ""
 
     is_safe = (cur_conc == 1 and cur_upw <= 2 and cur_streams == 4)
     is_fast = (cur_conc == 2 and cur_upw == 4 and cur_streams == 8)
@@ -1359,8 +1512,7 @@ def concurrent_keyboard(return_dl_key: str = "") -> InlineKeyboardMarkup:
         InlineKeyboardButton(f"📦 Buffer: {cur_buf} ▸", callback_data=f"conc:cycle_buf{suffix}"),
     ]
 
-    back_cb = f"dl:open:{return_dl_key}" if return_dl_key else "nav:home"
-    back_lbl = "⬅️ Back to Transfer" if return_dl_key else "⬅️ Back"
+    back_lbl, back_cb = _resolve_return_button(return_tag)
 
     return InlineKeyboardMarkup([
         preset_row,
@@ -1375,16 +1527,21 @@ def concurrent_keyboard(return_dl_key: str = "") -> InlineKeyboardMarkup:
 
 
 def settings_keyboard() -> InlineKeyboardMarkup:
+    """Master Bot Control Panel — every setting controllable from inline buttons."""
     with state_lock:
         del_on = delete_after_upload
         size_on = max_size_enabled
         cap_mb = max_size_bytes // (1024 * 1024)
+        split_mb = SPLIT_SIZE // (1024 * 1024)
         bw = BW_LIMIT or "OFF"
         conc = CONCURRENT_JOBS
         up_w = UPLOAD_WORKERS
         refr = int(BOARD_REFRESH_INTERVAL)
         auto_res = AUTO_RESUME_JOBS
+        def_mode = DEFAULT_UPLOAD_MODE
         ft_short = _fmt_file_types_short(enabled_file_types)
+
+    mode_lbl = "🎬 Media" if def_mode == "video" else "📄 Doc"
 
     return InlineKeyboardMarkup([
         [
@@ -1392,23 +1549,132 @@ def settings_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton(f"⚡ Speed: {conc}x·{up_w}w ▸", callback_data="nav:concurrent"),
         ],
         [
+            InlineKeyboardButton("📢 Dump Chat ▸", callback_data="nav:dump"),
+            InlineKeyboardButton(f"📤 Mode: {mode_lbl}", callback_data="cfg:toggle_mode"),
+        ],
+        [
             InlineKeyboardButton(f"🗑 Auto-Del: {'ON 🟢' if del_on else 'OFF 🔴'}", callback_data="cfg:toggle_del"),
             InlineKeyboardButton(f"▶️ Resume: {'ON 🟢' if auto_res else 'OFF 🔴'}", callback_data="cfg:toggle_resume"),
         ],
         [
             InlineKeyboardButton(f"📏 Cap: {f'{cap_mb}M 🟢' if size_on else 'OFF 🔴'}", callback_data="cfg:toggle_size"),
-            InlineKeyboardButton(f"📐 Limit: {cap_mb}M ▸", callback_data="cfg:cycle_size"),
+            InlineKeyboardButton(f"📐 {cap_mb}M ▸", callback_data="cfg:cycle_size"),
+            InlineKeyboardButton("✏️ Custom", callback_data="prompt:max_size"),
         ],
         [
+            InlineKeyboardButton(f"✂️ Split: {split_mb}M ▸", callback_data="cfg:cycle_split"),
             InlineKeyboardButton(f"🚦 BW: {bw} ▸", callback_data="cfg:cycle_bw"),
-            InlineKeyboardButton(f"⏱ Refresh: {refr}s ▸", callback_data="cfg:cycle_refresh"),
+            InlineKeyboardButton(f"⏱ {refr}s ▸", callback_data="cfg:cycle_refresh"),
         ],
         [
-            InlineKeyboardButton("🗄 MongoDB", callback_data="nav:db"),
+            InlineKeyboardButton("🚩 Flags ▸", callback_data="nav:flags"),
+            InlineKeyboardButton("👥 Users ▸", callback_data="nav:users"),
+            InlineKeyboardButton("🗄 MongoDB ▸", callback_data="nav:db"),
+        ],
+        [
             InlineKeyboardButton("🔄 Restart", callback_data="action:restart_bot"),
+            InlineKeyboardButton("🔌 Stop", callback_data="action:stop_bot"),
             InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
         ],
     ])
+
+
+def dump_chat_keyboard() -> InlineKeyboardMarkup:
+    """Interactive Dump Chat / Target Channel control panel."""
+    return InlineKeyboardMarkup([
+        [
+            InlineKeyboardButton("📍 Use This Chat", callback_data="dump:here"),
+            InlineKeyboardButton("👤 Use Owner DM", callback_data="dump:owner"),
+        ],
+        [
+            InlineKeyboardButton("✏️ Enter ID / Forward Msg", callback_data="prompt:dump_chat"),
+            InlineKeyboardButton("🔔 Test Upload Chat", callback_data="dump:test"),
+        ],
+        [
+            InlineKeyboardButton("⬅️ Control Panel", callback_data="nav:settings"),
+            InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+        ],
+    ])
+
+
+def rclone_manager_keyboard(remotes: list[str]) -> InlineKeyboardMarkup:
+    """Full Rclone Config Manager inside the bot."""
+    rows = [
+        [
+            InlineKeyboardButton("📤 Upload / Paste .conf", callback_data="prompt:rclone_conf"),
+            InlineKeyboardButton("📥 Download .conf", callback_data="rc:download"),
+        ]
+    ]
+    if remotes:
+        del_row = []
+        for r in remotes[:10]:
+            rname = r.rstrip(":")
+            k = _reg_path(rname)
+            del_row.append(InlineKeyboardButton(f"🗑 {rname[:12]}", callback_data=f"rc:del:{k}"))
+            if len(del_row) == 2:
+                rows.append(del_row)
+                del_row = []
+        if del_row:
+            rows.append(del_row)
+    rows.append([
+        InlineKeyboardButton("🗂 Browse Remotes", callback_data="nav:remotes:0"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def users_manager_keyboard() -> InlineKeyboardMarkup:
+    """Authorized Users Manager keyboard (Owner control from bot)."""
+    with state_lock:
+        users = sorted(AUTHORIZED_USERS)
+    rows = [
+        [InlineKeyboardButton("➕ Add User ID", callback_data="prompt:add_user")]
+    ]
+    del_row = []
+    for uid in users:
+        if uid == OWNER_ID:
+            continue
+        del_row.append(InlineKeyboardButton(f"🗑 {uid}", callback_data=f"usr:del:{uid}"))
+        if len(del_row) == 2:
+            rows.append(del_row)
+            del_row = []
+    if del_row:
+        rows.append(del_row)
+    rows.append([
+        InlineKeyboardButton("⬅️ Control Panel", callback_data="nav:settings"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+    ])
+    return InlineKeyboardMarkup(rows)
+
+
+def flags_manager_keyboard() -> InlineKeyboardMarkup:
+    """Rclone Extra Flags Manager keyboard."""
+    cur_tokens = set(_rclone_extra_flags())
+    rows = []
+    pair = []
+    for flag_str, label in _POPULAR_FLAGS:
+        on = flag_str in cur_tokens
+        pair.append(
+            InlineKeyboardButton(
+                f"{'✅ ' if on else ''}{label}",
+                callback_data=f"flg:toggle:{flag_str}",
+            )
+        )
+        if len(pair) == 2:
+            rows.append(pair)
+            pair = []
+    if pair:
+        rows.append(pair)
+
+    rows.append([
+        InlineKeyboardButton("✏️ Set Custom Flags", callback_data="prompt:rclone_flags"),
+        InlineKeyboardButton("🧹 Clear All Flags", callback_data="flg:clear"),
+    ])
+    rows.append([
+        InlineKeyboardButton("⬅️ Control Panel", callback_data="nav:settings"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+    ])
+    return InlineKeyboardMarkup(rows)
 
 
 def db_keyboard() -> InlineKeyboardMarkup:
@@ -1422,7 +1688,7 @@ def db_keyboard() -> InlineKeyboardMarkup:
             InlineKeyboardButton("🗑 Clear Job", callback_data="db:clear_job"),
         ],
         [
-            InlineKeyboardButton("⬅️ Settings", callback_data="nav:settings"),
+            InlineKeyboardButton("⬅️ Control Panel", callback_data="nav:settings"),
             InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
         ],
     ])
@@ -1451,15 +1717,17 @@ def active_job_keyboard() -> InlineKeyboardMarkup:
     ])
 
 
-def mode_keyboard(remote_path: str) -> InlineKeyboardMarkup:
+def mode_keyboard(remote_path: str, is_single_file: bool | None = None) -> InlineKeyboardMarkup:
     """
-    Clean, simple 4-row Transfer Launchpad keyboard:
+    4-row Transfer Launchpad keyboard:
       • Row 1 (Start):       [▶️ Start (Media)] | [📄 Start (Document)]
-      • Row 2 (File Types):  [📦 All] | [🎬 Video] | [🖼 Image] | [📄 Doc]
+      • Row 2 (File Types):  [📦 All] | [🎬 Video] | [🖼 Image] | [📄 Doc]  (or Delete File on Remote if single file)
       • Row 3 (Quick Opts):  [🗑 Del: OFF] | [📏 Cap: OFF] | [⚡ 2x·4w]
-      • Row 4 (Navigation):  [⬅️ Remotes] | [🏠 Home] | [✖️ Close]
+      • Row 4 (Navigation):  [⬅️ Back] | [🏠 Home] | [✖️ Close]
     """
-    key = _reg_path(remote_path)
+    key = _reg_path(remote_path, is_single_file=is_single_file)
+    single_mode = _is_single_file_key(key) if is_single_file is None else is_single_file
+
     with state_lock:
         del_on = delete_after_upload
         size_on = max_size_enabled
@@ -1473,28 +1741,50 @@ def mode_keyboard(remote_path: str) -> InlineKeyboardMarkup:
     only_img = (ft == {"image"})
     only_doc = (ft == {"document"})
 
-    return InlineKeyboardMarkup([
+    rows = [
         [
             InlineKeyboardButton("▶️ Start (Media)", callback_data=f"dl:go:video:{key}"),
             InlineKeyboardButton("📄 Start (Document)", callback_data=f"dl:go:doc:{key}"),
         ],
-        [
+    ]
+    if single_mode:
+        rows.append([
+            InlineKeyboardButton("🗑 Delete This File from Remote", callback_data=f"dl:rmfile:{key}"),
+        ])
+    else:
+        rows.append([
             InlineKeyboardButton("✅ All" if is_all else "📦 All", callback_data=f"dl:ft:all:{key}"),
             InlineKeyboardButton("✅ Video" if only_vid else "🎬 Video", callback_data=f"dl:ft:video:{key}"),
             InlineKeyboardButton("✅ Image" if only_img else "🖼 Image", callback_data=f"dl:ft:image:{key}"),
             InlineKeyboardButton("✅ Doc" if only_doc else "📄 Doc", callback_data=f"dl:ft:document:{key}"),
-        ],
+        ])
+
+    parent_cb = "nav:remotes:0"
+    if ":" in remote_path:
+        r_prefix, r_rest = remote_path.split(":", 1)
+        r_rest = r_rest.strip("/")
+        if r_rest:
+            if single_mode:
+                parent_rest = r_rest.rsplit("/", 1)[0] if "/" in r_rest else ""
+                parent_path = f"{r_prefix}:{parent_rest}" if parent_rest else f"{r_prefix}:"
+                parent_cb = f"br:files:{_reg_path(parent_path, is_single_file=False)}:0"
+            else:
+                parent_cb = f"br:dir:{key}:0"
+
+    ret_tag = f"s_{key}" if single_mode else f"d_{key}"
+    rows += [
         [
             InlineKeyboardButton(f"🗑 Del: {'ON' if del_on else 'OFF'}", callback_data=f"dl:del:{key}"),
             InlineKeyboardButton(f"📏 Cap: {f'{cap_mb}M' if size_on else 'OFF'}", callback_data=f"dl:size:{key}"),
-            InlineKeyboardButton(f"⚡ {conc}x·{up_w}w", callback_data=f"nav:concurrent:{key}"),
+            InlineKeyboardButton(f"⚡ {conc}x·{up_w}w", callback_data=f"nav:concurrent:{ret_tag}"),
         ],
         [
-            InlineKeyboardButton("⬅️ Remotes", callback_data="nav:remotes:0"),
+            InlineKeyboardButton("⬅️ Back", callback_data=parent_cb),
             InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
             InlineKeyboardButton("✖️ Close", callback_data="action:close"),
         ],
-    ])
+    ]
+    return InlineKeyboardMarkup(rows)
 
 
 def _build_home_text() -> str:
@@ -1505,13 +1795,16 @@ def _build_home_text() -> str:
         conc = CONCURRENT_JOBS
         up_w = UPLOAD_WORKERS
         streams = RCLONE_STREAMS
+        dump_id = DUMP_CHAT_ID
+        is_running = bool(active_sessions)
+        def_mode = "Media" if DEFAULT_UPLOAD_MODE == "video" else "Document"
         ft_badge = _fmt_file_types_badge(enabled_file_types)
     with stats_lock:
         done = stats["total_done"]
         failed = stats["total_failed"]
         tbytes = stats["total_bytes"]
 
-    state_str = "🟡 **Transferring**" if active_sessions else "🟢 **Ready**"
+    state_str = "🟡 **Transferring**" if is_running else "🟢 **Ready**"
     db_str = "MongoDB" if db_mgr.connected else "Local JSON"
 
     return (
@@ -1519,6 +1812,7 @@ def _build_home_text() -> str:
         f"{state_str} · ⏱ `{fmt_uptime()}` · 🗄 `{db_str}`\n\n"
         f"• 🎯 **File Types:** `{ft_badge}`\n"
         f"• ⚡ **Speed:** `{conc}x Jobs · {up_w}w Upload · {streams}s Rclone`\n"
+        f"• 📢 **Dump Chat:** `{dump_id}` · 📤 **Mode:** `{def_mode}`\n"
         f"• 🗑 **Auto-Delete:** `{'ON' if del_on else 'OFF'}` · 📏 **Size Cap:** `{f'{cap_mb} MB' if size_on else 'OFF'}`\n"
         f"• 📊 **Transferred:** `{done}` files (`{fmt_size(tbytes)}`) · `{failed}` failed"
     )
@@ -1569,19 +1863,22 @@ def _build_status_text() -> str:
         up_w = UPLOAD_WORKERS
         streams = RCLONE_STREAMS
         buf = RCLONE_BUFFER_SIZE
+        dump_id = DUMP_CHAT_ID
+        is_running = bool(active_sessions)
         ft_badge = _fmt_file_types_badge(enabled_file_types)
 
-    badge = "🟡 **Transferring**" if active_sessions else "🟢 **Online & Idle**"
+    badge = "🟡 **Transferring**" if is_running else "🟢 **Online & Idle**"
     db_state = f"MongoDB (`{MONGO_DB_NAME}`)" if db_mgr.connected else "Local JSON"
     cur = snap["current_files"]
 
     lines = [
-        f"📊 **System Status**",
+        f"📊 **System Status & Tools**",
         f"{badge} · ⏱ `{fmt_uptime()}` · 🗄 {db_state}",
         "",
         f"• ✅ **Done:** `{snap['total_done']}` (`{fmt_size(snap['total_bytes'])}`) · ❌ **Failed:** `{snap['total_failed']}` · ⏭ **Skipped:** `{snap.get('total_skipped', 0)}`",
         f"• 🎯 **Types:** `{ft_badge}`",
         f"• ⚡ **Speed:** `{conc}x Jobs · {up_w}w Upload · {streams}s/{buf} Rclone`",
+        f"• 📢 **Dump Chat:** `{dump_id}`",
     ]
     res = _server_resources()
     if res:
@@ -1602,6 +1899,7 @@ def _build_settings_text() -> str:
         del_on = delete_after_upload
         size_on = max_size_enabled
         cap_mb = max_size_bytes // (1024 * 1024)
+        split_mb = SPLIT_SIZE // (1024 * 1024)
         bw = BW_LIMIT or "Unlimited"
         conc = CONCURRENT_JOBS
         up_w = UPLOAD_WORKERS
@@ -1609,22 +1907,82 @@ def _build_settings_text() -> str:
         buf = RCLONE_BUFFER_SIZE
         refr = BOARD_REFRESH_INTERVAL
         auto_res = AUTO_RESUME_JOBS
+        dump_id = DUMP_CHAT_ID
+        def_mode = "🎬 Media" if DEFAULT_UPLOAD_MODE == "video" else "📄 Document"
+        flags_str = RCLONE_FLAGS or "None"
+        users_cnt = len(AUTHORIZED_USERS)
         ft_badge = _fmt_file_types_badge(enabled_file_types)
 
     return (
-        f"⚙️ **Bot Settings** _(Synced to MongoDB)_\n\n"
+        f"⚙️ **Bot Control Panel** _(100% Synced to MongoDB)_\n\n"
         f"• 🎯 **File Types:** `{ft_badge}`\n"
         f"• ⚡ **Speed:** `{conc}x Jobs · {up_w}w Upload · {streams}s/{buf}`\n"
+        f"• 📢 **Dump Chat ID:** `{dump_id}` · 📤 **Default Mode:** `{def_mode}`\n"
         f"• 🗑 **Auto-Delete Remote:** `{'ON 🟢' if del_on else 'OFF 🔴'}`\n"
         f"• ▶️ **Auto-Resume Jobs:** `{'ON 🟢' if auto_res else 'OFF 🔴'}`\n"
         f"• 📏 **Max File Size Cap:** `{f'{cap_mb} MB 🟢' if size_on else 'OFF 🔴'}`\n"
-        f"• 🚦 **BW Limit:** `{bw}` · ⏱ **Refresh:** `{refr:.0f}s`"
+        f"• ✂️ **Split Threshold:** `{split_mb} MB` · 🚦 **BW Limit:** `{bw}`\n"
+        f"• 🚩 **Rclone Flags:** `{flags_str}`\n"
+        f"• 👥 **Authorized Users:** `{users_cnt}` · ⏱ **Refresh:** `{refr:.0f}s`"
+    )
+
+
+def _build_dump_chat_text() -> str:
+    with state_lock:
+        dump_id = DUMP_CHAT_ID
+    is_owner = (dump_id == OWNER_ID)
+    label = f"`{dump_id}` _(Owner DM)_" if is_owner else f"`{dump_id}` _(Channel / Group)_"
+    return (
+        f"📢 **Dump Chat / Upload Destination**\n\n"
+        f"• **Current Target:** {label}\n\n"
+        f"**How to change from the bot:**\n"
+        f"1. Tap **📍 Use This Chat** to upload files right here.\n"
+        f"2. Tap **👤 Use Owner DM** to upload to your private chat.\n"
+        f"3. Tap **✏️ Enter ID / Forward Msg** and send a channel/group ID (e.g. `-1001234567890`) or forward any message from that channel."
+    )
+
+
+async def _build_rclone_manager_text() -> tuple[str, list[str]]:
+    remotes = await rclone_list_remotes()
+    rc_exists = _safe_conf_exists()
+    size_b = RCLONE_CONF_PATH.stat().st_size if rc_exists else 0
+    rem_list = ", ".join(f"`{r.rstrip(':')}`" for r in remotes) if remotes else "_None configured_"
+    text = (
+        f"🔧 **Rclone Config Manager (`rclone.conf`)**\n\n"
+        f"• 📄 **Status:** `{f'Active ({fmt_size(size_b)})' if rc_exists else 'Missing'}`\n"
+        f"• ☁️ **Remotes (`{len(remotes)}`):** {rem_list}\n\n"
+        f"_Upload or paste a new `rclone.conf`, download your current config, or tap a remote below to remove it:_"
+    )
+    return text, remotes
+
+
+def _build_users_manager_text() -> str:
+    with state_lock:
+        users = sorted(AUTHORIZED_USERS)
+    ulist = "\n".join(
+        f"• `{u}`" + (" _(Owner — Permanent)_" if u == OWNER_ID else "")
+        for u in users
+    )
+    return (
+        f"👥 **Authorized Users Manager**\n\n"
+        f"{ulist}\n\n"
+        f"_Tap **➕ Add User ID** to authorize a new user, or tap a user ID button below to revoke access:_"
+    )
+
+
+def _build_flags_manager_text() -> str:
+    with state_lock:
+        flags_raw = RCLONE_FLAGS
+    return (
+        f"🚩 **Rclone Extra Flags**\n\n"
+        f"• **Active Flags:** `{flags_raw or 'None'}`\n\n"
+        f"_Toggle popular flags below with 1 tap, or set custom Rclone flags:_"
     )
 
 
 async def _build_db_text() -> str:
     unfinished = await db_mgr.get_unfinished_job()
-    rc_exists = RCLONE_CONF_PATH.exists()
+    rc_exists = _safe_conf_exists()
     remotes_cnt = 0
     if rc_exists:
         try:
@@ -1650,7 +2008,10 @@ async def _build_db_text() -> str:
     )
 
 
-def _build_dl_prompt_text(remote_path: str) -> str:
+def _build_dl_prompt_text(remote_path: str, is_single_file: bool | None = None) -> str:
+    key = _reg_path(remote_path, is_single_file=is_single_file)
+    single_mode = _is_single_file_key(key) if is_single_file is None else is_single_file
+
     with state_lock:
         del_on = delete_after_upload
         size_on = max_size_enabled
@@ -1658,19 +2019,36 @@ def _build_dl_prompt_text(remote_path: str) -> str:
         conc = CONCURRENT_JOBS
         up_w = UPLOAD_WORKERS
         streams = RCLONE_STREAMS
+        dump_id = DUMP_CHAT_ID
         ft_badge = _fmt_file_types_badge(enabled_file_types)
 
+    if single_mode:
+        fname_disp = _remote_basename(remote_path, is_remote=True)
+        cat = (_classify_file_ext(fname_disp) or "document").capitalize()
+        return (
+            f"📄 **Single File Transfer**\n"
+            f"📂 `{remote_path}`\n\n"
+            f"• 🏷 **Detected Type:** `{cat}`\n"
+            f"• ⚡ **Speed:** `{conc}x Jobs · {up_w}w Upload · {streams}s Rclone`\n"
+            f"• 📢 **Dump Chat:** `{dump_id}`\n"
+            f"• 🗑 **Auto-Delete:** `{'ON' if del_on else 'OFF'}` · 📏 **Size Cap:** `{f'{cap_mb} MB' if size_on else 'OFF'}`\n\n"
+            f"_Choose upload mode or adjust options below:_"
+        )
+
     return (
-        f"🚀 **Transfer Launchpad**\n"
+        f"🚀 **Folder Transfer Launchpad**\n"
         f"📂 `{remote_path}`\n\n"
         f"• 🎯 **Types:** `{ft_badge}`\n"
         f"• ⚡ **Speed:** `{conc}x Jobs · {up_w}w Upload · {streams}s Rclone`\n"
+        f"• 📢 **Dump Chat:** `{dump_id}`\n"
         f"• 🗑 **Auto-Delete:** `{'ON' if del_on else 'OFF'}` · 📏 **Size Cap:** `{f'{cap_mb} MB' if size_on else 'OFF'}`\n\n"
-        f"_Select file type filter or start transfer below:_"
+        f"_Choose upload mode or adjust options below:_"
     )
 
 
-# ── 9. High-Speed Async Subprocess Engine (rclone / ffmpeg / ffprobe) ────────
+# ==============================================================================
+#  STEP 9: High-Speed Async Subprocess Engine (rclone / ffmpeg / ffprobe)
+# ==============================================================================
 _RCLONE_STATS_RE = re.compile(
     r"(?:Transferred:\s+)?([\d.]+\s*\S+)\s*/\s*([\d.]+\s*\S+),\s*(\d+)%,\s*([\d.]+\s*\S+/s)(?:,\s*ETA\s*(\S+))?",
     re.IGNORECASE,
@@ -1712,7 +2090,6 @@ _last_edits: collections.OrderedDict[tuple[int, int], tuple[str, str]] = collect
 
 
 def _markup_sig(markup: InlineKeyboardMarkup | None) -> str:
-    """Deterministic signature of an InlineKeyboardMarkup's buttons and callback_data."""
     if not markup or not getattr(markup, "inline_keyboard", None):
         return ""
     return "|".join(
@@ -1832,10 +2209,40 @@ async def rclone_list_dirs(remote_path: str) -> tuple[list[str], str]:
     return dirs, ""
 
 
+async def rclone_list_folder_files(remote_path: str) -> tuple[list[tuple[str, int]], str]:
+    """List immediate files (non-recursive) in `remote_path` with sizes for the in-bot File Browser."""
+    remote_path = _normalize_remote_path(remote_path)
+    with state_lock:
+        allowed_types = set(enabled_file_types)
+    cmd = [
+        "rclone", "lsjson", "--files-only", "--no-modtime", "--no-mimetype", remote_path
+    ] + _rclone_extra_flags()
+    code, out, err = await _run_cmd_async(cmd, timeout=45.0)
+    if code != 0:
+        return [], (err.strip() or "Failed to list files")
+    try:
+        items = json.loads(out)
+        if not isinstance(items, list):
+            return [], ""
+        result: list[tuple[str, int]] = []
+        for entry in items:
+            if entry.get("IsDir"):
+                continue
+            name = (entry.get("Name") or entry.get("Path") or "").strip().lstrip("/")
+            if not name or not _file_matches_types(name, allowed_types):
+                continue
+            sz = int(entry.get("Size") or 0)
+            result.append((name, sz))
+        return result, ""
+    except Exception as e:
+        return [], str(e)
+
+
 async def rclone_list(
     remote_path: str,
     user_id: int = 0,
     allowed_types: set[str] | None = None,
+    skip_type_filter: bool = False,
 ) -> list[str]:
     if allowed_types is None:
         with state_lock:
@@ -1847,10 +2254,16 @@ async def rclone_list(
     if code != 0:
         raise RuntimeError(err.strip() or "rclone lsf failed")
 
-    return [
-        f.strip().lstrip("/") for f in out.splitlines()
-        if f.strip() and _file_matches_types(f.strip(), allowed_types)
-    ]
+    raw_files = [f.strip().lstrip("/") for f in out.splitlines() if f.strip()]
+    if skip_type_filter:
+        return raw_files
+    # If the user pointed directly to a single file on the remote, never filter it out
+    if len(raw_files) == 1 and (
+        remote_path.endswith("/" + raw_files[0])
+        or remote_path.endswith(":" + raw_files[0])
+    ):
+        return raw_files
+    return [f for f in raw_files if _file_matches_types(f, allowed_types)]
 
 
 async def rclone_size_map(remote_path: str, user_id: int = 0) -> dict[str, int]:
@@ -1903,10 +2316,8 @@ async def rclone_download(
 ) -> str:
     """
     High-throughput Rclone downloader:
-      • Uses chunked `stderr.read(4096)` splitting on both `\\r` and `\\n` so long
-        carriage-return progress streams never raise `asyncio.LimitOverrunError`.
-      • Uses `dest_filename` (when provided) so filenames containing colons (`:`)
-        are never truncated.
+      • Uses chunked `stderr.read(4096)` splitting on both `\\r` and `\\n`.
+      • Preserves filenames containing colons (`:`).
     """
     _filename = (dest_filename or _remote_basename(remote_path, is_remote=True)).replace("\x00", "").strip() or "file"
     local_dest = os.path.abspath(os.path.join(dest_dir, _filename))
@@ -2009,6 +2420,16 @@ async def rclone_delete(remote_path: str, user_id: int = 0) -> None:
     if code != 0:
         raise RuntimeError(err.strip() or "rclone deletefile failed")
     log.info(f"🗑 Deleted from remote: {remote_path}")
+
+
+def _remove_rclone_remote_section(conf_text: str, remote_name: str) -> str:
+    """Remove `[remote_name]` section from `rclone.conf` text."""
+    pattern = re.compile(
+        rf"^\[{re.escape(remote_name)}\]\s*\n(?:(?!^\[).*\n?)*",
+        re.MULTILINE,
+    )
+    cleaned = pattern.sub("", conf_text).strip()
+    return (cleaned + "\n") if cleaned else ""
 
 
 def _parse_ffprobe_duration(data: dict[str, Any]) -> float:
@@ -2134,8 +2555,8 @@ def _split_binary_file_sync(local_path: str, split_dir_path: Path, chunk_size: i
     with open(local_path, "rb") as src:
         part_num = 1
         while True:
-            if cancel_flags.get(user_id) or force_kill_flags.get(user_id):
-                raise RuntimeError("Job cancelled during binary split")
+            if force_kill_flags.get(user_id):
+                raise RuntimeError("Job aborted by user")
             first_block = src.read(buf_len)
             if not first_block:
                 break
@@ -2145,8 +2566,8 @@ def _split_binary_file_sync(local_path: str, split_dir_path: Path, chunk_size: i
                 dst.write(first_block)
                 written += len(first_block)
                 while written < chunk_size:
-                    if cancel_flags.get(user_id) or force_kill_flags.get(user_id):
-                        raise RuntimeError("Job cancelled during binary split")
+                    if force_kill_flags.get(user_id):
+                        raise RuntimeError("Job aborted by user")
                     to_read = min(buf_len, chunk_size - written)
                     blk = src.read(to_read)
                     if not blk:
@@ -2159,8 +2580,10 @@ def _split_binary_file_sync(local_path: str, split_dir_path: Path, chunk_size: i
 
 
 async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) -> list[str]:
+    with state_lock:
+        cur_split_limit = SPLIT_SIZE
     size = os.path.getsize(local_path)
-    if size <= SPLIT_SIZE:
+    if size <= cur_split_limit:
         return [local_path]
 
     split_dir_path = Path(split_dir)
@@ -2175,11 +2598,13 @@ async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) ->
                 _split_binary_file_sync,
                 local_path,
                 split_dir_path,
-                SPLIT_SIZE - 2_000_000,
+                cur_split_limit - 2_000_000,
                 user_id,
             )
             return parts or [local_path]
         except Exception as e:
+            if force_kill_flags.get(user_id):
+                raise
             log.warning(f"Binary split fallback warning for {filename}: {e}")
             shutil.rmtree(split_dir_path, ignore_errors=True)
             return [local_path]
@@ -2191,15 +2616,15 @@ async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) ->
     if duration <= 0:
         return await _binary_fallback()
 
-    split_size = SPLIT_SIZE - 3_000_000
+    split_size = cur_split_limit - 3_000_000
     start_time = 0
     i = 1
     multi_streams = True
     out_paths: list[str] = []
 
     while start_time < duration - 4 and i <= 100:
-        if cancel_flags.get(user_id) or force_kill_flags.get(user_id):
-            raise RuntimeError("Job cancelled during video split")
+        if force_kill_flags.get(user_id):
+            raise RuntimeError("Job aborted by user")
         out_path = str(split_dir_path / f"{stem}.part{i:03}{extension}")
 
         prefix = ["taskset", "-c", f"{cores}"] if (cores != "0" and _HAS_TASKSET) else []
@@ -2236,8 +2661,8 @@ async def split_file_async(local_path: str, split_dir: str, user_id: int = 0) ->
             return await _binary_fallback()
 
         out_size = os.path.getsize(out_path)
-        if out_size > SPLIT_SIZE:
-            new_split_size = split_size - (out_size - SPLIT_SIZE) - 5_000_000
+        if out_size > cur_split_limit:
+            new_split_size = split_size - (out_size - cur_split_limit) - 5_000_000
             try:
                 os.remove(out_path)
             except OSError:
@@ -2296,7 +2721,9 @@ async def _send_with_retry(coro_fn, *args, max_retries: int = 5, on_retry=None, 
                 on_retry()
 
 
-# ── 10. Clean & Simple Live Transfer Progress Board ──────────────────────────
+# ==============================================================================
+#  STEP 10: Live Transfer Progress Board (_BoardState)
+# ==============================================================================
 def _render_board(total_files: int, concurrent: int, progress_map: dict, user_id: int = 0) -> str:
     is_cancelling = cancel_flags.get(user_id, False)
     with state_lock:
@@ -2307,14 +2734,15 @@ def _render_board(total_files: int, concurrent: int, progress_map: dict, user_id
     done = sum(1 for _, v in snap_items if v.startswith(("✅ ", "✅🗑", "✅⚠️")))
     failed = sum(1 for _, v in snap_items if v.startswith("❌"))
     skipped = sum(1 for _, v in snap_items if v.startswith("⏭"))
+    aborted = sum(1 for _, v in snap_items if v.startswith("🛑"))
 
     active_entries = {
         k: v for k, v in snap_items
-        if not (v.startswith(("✅ ", "✅🗑", "✅⚠️")) or v.startswith("❌") or v.startswith("⏭"))
+        if not (v.startswith(("✅ ", "✅🗑", "✅⚠️")) or v.startswith("❌") or v.startswith("⏭") or v.startswith("🛑"))
     }
-    queued = max(0, total_files - done - failed - skipped - len(active_entries))
+    queued = max(0, total_files - done - failed - skipped - aborted - len(active_entries))
 
-    overall_done = done + failed + skipped
+    overall_done = done + failed + skipped + aborted
     overall_bar = progress_bar(overall_done, total_files, 10)
     overall_pct = int(overall_done * 100 / total_files) if total_files > 0 else 0
 
@@ -2404,7 +2832,9 @@ async def _push_board(
         await safe_edit(status_msg, text, reply_markup=active_job_keyboard())
 
 
-# ── 11. Pipelined Transfer Engine (Parallel Download + Upload Semaphores) ────
+# ==============================================================================
+#  STEP 11: Pipelined Transfer Engine (Parallel Download + Upload Semaphores)
+# ==============================================================================
 async def upload_part_with_progress(
     part_path: str,
     caption: str,
@@ -2431,6 +2861,9 @@ async def upload_part_with_progress(
     part_str = f"{part_idx}/{total_parts}" if total_parts > 1 else ""
     last_cb_time = [0.0]
     upload_start = [loop.time()]
+
+    with state_lock:
+        target_chat_id = DUMP_CHAT_ID
 
     def _reset_timer():
         upload_start[0] = loop.time()
@@ -2481,7 +2914,7 @@ async def upload_part_with_progress(
             video_meta_kw["width"] = width
             video_meta_kw["height"] = height
         return await _send_with_retry(
-            app.send_video, DUMP_CHAT_ID, part_path,
+            app.send_video, target_chat_id, part_path,
             caption=caption, supports_streaming=True,
             progress=progress_handler,
             on_retry=_reset_timer,
@@ -2493,7 +2926,7 @@ async def upload_part_with_progress(
         reply_kw = _build_reply_kwargs(app.send_audio, reply_to_message_id)
         thumb_kw = _build_thumb_kwargs(app.send_audio, thumb)
         return await _send_with_retry(
-            app.send_audio, DUMP_CHAT_ID, part_path,
+            app.send_audio, target_chat_id, part_path,
             caption=caption,
             progress=progress_handler,
             on_retry=_reset_timer,
@@ -2504,7 +2937,7 @@ async def upload_part_with_progress(
         reply_kw = _build_reply_kwargs(app.send_photo, reply_to_message_id)
         try:
             return await _send_with_retry(
-                app.send_photo, DUMP_CHAT_ID, part_path,
+                app.send_photo, target_chat_id, part_path,
                 caption=caption,
                 progress=progress_handler,
                 on_retry=_reset_timer,
@@ -2515,7 +2948,7 @@ async def upload_part_with_progress(
             _reset_timer()
             reply_doc_kw = _build_reply_kwargs(app.send_document, reply_to_message_id)
             return await _send_with_retry(
-                app.send_document, DUMP_CHAT_ID, part_path,
+                app.send_document, target_chat_id, part_path,
                 caption=caption,
                 progress=progress_handler,
                 on_retry=_reset_timer,
@@ -2525,7 +2958,7 @@ async def upload_part_with_progress(
         reply_kw = _build_reply_kwargs(app.send_document, reply_to_message_id)
         thumb_kw = _build_thumb_kwargs(app.send_document, thumb)
         return await _send_with_retry(
-            app.send_document, DUMP_CHAT_ID, part_path,
+            app.send_document, target_chat_id, part_path,
             caption=caption,
             progress=progress_handler,
             on_retry=_reset_timer,
@@ -2622,6 +3055,10 @@ async def process_one_file(
                         dest_filename=fname_display,
                     )
                 except Exception as e:
+                    if force_kill_flags.get(user_id):
+                        with state_lock:
+                            progress_map[idx] = f"🛑 `[{idx}/{total}]` Aborted: `{fname_display}`"
+                        return
                     log.error(f"[{idx}/{total}] Download failed: {fname} — {e}")
                     with state_lock:
                         progress_map[idx] = f"❌ `[{idx}/{total}]` DL failed: `{fname_display}`"
@@ -2648,16 +3085,20 @@ async def process_one_file(
             # ── Phase 2: Split, Thumbnail & Telegram Upload (under ul_semaphore) ──
             async with ul_semaphore:
                 if force_kill_flags.get(user_id):
+                    with state_lock:
+                        progress_map[idx] = f"🛑 `[{idx}/{total}]` Aborted: `{fname_display}`"
                     return
 
-                needs_split = file_size > SPLIT_SIZE
+                with state_lock:
+                    cur_split_limit = SPLIT_SIZE
+                needs_split = file_size > cur_split_limit
 
                 try:
                     if needs_split:
                         with state_lock:
                             progress_map[idx] = (
                                 f"✂️ `[{idx}/{total}]` `{fname_display}`\n"
-                                f"🔄 _Splitting `{fmt_size(file_size)}` into <2GB parts…_"
+                                f"🔄 _Splitting `{fmt_size(file_size)}` into `{fmt_size(cur_split_limit)}` parts…_"
                             )
                         await _push_board(status_msg, total, job_concurrent, progress_map, board_state, user_id)
                         split_dir = local_path + "_parts"
@@ -2780,6 +3221,10 @@ async def process_one_file(
                         board_state.mark_dirty()
 
                 except Exception as e:
+                    if force_kill_flags.get(user_id):
+                        with state_lock:
+                            progress_map[idx] = f"🛑 `[{idx}/{total}]` Aborted: `{fname_display}`"
+                        return
                     log.error(f"[{idx}/{total}] Transfer failed: {fname} — {e}")
                     with state_lock:
                         progress_map[idx] = f"❌ `[{idx}/{total}]` Failed: `{fname_display}`"
@@ -2810,7 +3255,8 @@ async def _run_job(
     global last_failed, last_job_remote, last_job_mode
 
     remote_path = _normalize_remote_path(remote_path)
-    done_set = set(already_done or [])
+    done_ordered = list(dict.fromkeys(already_done or []))
+    done_set = set(done_ordered)
     pending_files = [f for f in files if f not in done_set]
     total = len(files)
     mode_icon = "🎬 Media" if mode == "video" else "📄 Document"
@@ -2829,10 +3275,11 @@ async def _run_job(
         reply_markup=active_job_keyboard(),
     )
 
-    active_sessions.add(user_id)
-    cancel_flags[user_id] = False
-    force_kill_flags[user_id] = False
-    upload_mode[user_id] = mode
+    with state_lock:
+        active_sessions.add(user_id)
+        cancel_flags[user_id] = False
+        force_kill_flags[user_id] = False
+        upload_mode[user_id] = mode
     with stats_lock:
         stats["current_files"] = [_remote_basename(f, is_remote=False) for f in pending_files[:3]]
 
@@ -2847,8 +3294,8 @@ async def _run_job(
             progress_map[idx_pre] = f"✅ `[{idx_pre}/{total}]` `{_remote_basename(fname_pre, is_remote=False)}` · _resumed_"
 
     results = {
-        "success": len(done_set),
-        "done_files": list(done_set),
+        "success": len(done_ordered),
+        "done_files": list(done_ordered),
         "failed": [],
         "deleted": 0,
         "delete_failed": [],
@@ -2902,7 +3349,7 @@ async def _run_job(
             _rp = remote_path
             if (
                 total == 1
-                and (_rp.endswith("/" + fname) or _rp.endswith(":" + fname))
+                and (_rp.endswith("/" + fname) or _rp.endswith(":" + fname) or _rp == fname)
             ):
                 full_remote = _rp
             elif _rp.endswith(":"):
@@ -2916,8 +3363,9 @@ async def _run_job(
     finally:
         await board_state.stop()
         kill_user_procs(user_id)
-        active_sessions.discard(user_id)
-        was_cancelled = cancel_flags.pop(user_id, False) or force_kill_flags.pop(user_id, False)
+        with state_lock:
+            active_sessions.discard(user_id)
+            was_cancelled = cancel_flags.pop(user_id, False) or force_kill_flags.pop(user_id, False)
         with stats_lock:
             stats["current_files"] = []
 
@@ -2985,7 +3433,8 @@ async def _send_summary(status_msg: Message, results: dict) -> None:
         rows.append([InlineKeyboardButton(f"🔁 Retry Failed ({len(failed)})", callback_data="action:retry")])
     if remote_path:
         key = _reg_path(remote_path)
-        rows.append([InlineKeyboardButton("📂 Transfer Options", callback_data=f"dl:open:{key}")])
+        open_cb = f"dl:file:{key}" if _is_single_file_key(key) else f"dl:open:{key}"
+        rows.append([InlineKeyboardButton("📂 Transfer Options", callback_data=open_cb)])
     rows.append([
         InlineKeyboardButton("🗂 Remotes", callback_data="nav:remotes:0"),
         InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
@@ -2997,7 +3446,7 @@ async def _send_summary(status_msg: Message, results: dict) -> None:
 
 async def _resume_saved_job(saved_job: dict[str, Any], notify_chat_id: int | None = None) -> None:
     try:
-        if active_sessions:
+        if _has_active_session():
             return
         remote_path = _normalize_remote_path(saved_job.get("remote_path", ""))
         mode = saved_job.get("mode", DEFAULT_UPLOAD_MODE)
@@ -3044,7 +3493,9 @@ async def _resume_saved_job(saved_job: dict[str, Any], notify_chat_id: int | Non
         log.error(f"Auto-resume job error: {e}")
 
 
-# ── Interactive Remote Browser Builder ────────────────────────────────────────
+# ==============================================================================
+#  STEP 12: Interactive Remote, Folder & Single-File Browser
+# ==============================================================================
 async def _build_remotes_browser(remote_path: str = "", page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     PAGE_SIZE = 8
     if not remote_path:
@@ -3052,10 +3503,10 @@ async def _build_remotes_browser(remote_path: str = "", page: int = 0) -> tuple[
         if not remotes:
             text = (
                 "🗂 **Rclone Remotes**\n\n"
-                "⚠️ No remotes found. Tap **🔧 Set rclone.conf** below to upload your config."
+                "⚠️ No remotes found. Tap **🔧 rclone.conf** below to upload or paste your config."
             )
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton("🔧 Set rclone.conf", callback_data="nav:setrclone")],
+                [InlineKeyboardButton("🔧 rclone.conf Manager", callback_data="nav:rclone")],
                 [InlineKeyboardButton("🏠 Home", callback_data="nav:home")],
             ])
             return text, kb
@@ -3068,7 +3519,7 @@ async def _build_remotes_browser(remote_path: str = "", page: int = 0) -> tuple[
         for i in range(0, len(chunk), 2):
             row = []
             for r in chunk[i:i + 2]:
-                k = _reg_path(r)
+                k = _reg_path(r, is_single_file=False)
                 row.append(InlineKeyboardButton(f"☁️ {r.rstrip(':')}", callback_data=f"br:dir:{k}:0"))
             rows.append(row)
 
@@ -3085,7 +3536,8 @@ async def _build_remotes_browser(remote_path: str = "", page: int = 0) -> tuple[
             ft_short = _fmt_file_types_short(enabled_file_types)
 
         rows.append([
-            InlineKeyboardButton(f"🎯 Types: {ft_short}", callback_data="nav:filetypes"),
+            InlineKeyboardButton(f"🎯 Types: {ft_short}", callback_data="nav:filetypes:r_0"),
+            InlineKeyboardButton("🔧 rclone.conf", callback_data="nav:rclone"),
             InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
         ])
         text = (
@@ -3104,16 +3556,19 @@ async def _build_remotes_browser(remote_path: str = "", page: int = 0) -> tuple[
         ft_short = _fmt_file_types_short(enabled_file_types)
         ft_badge = _fmt_file_types_badge(enabled_file_types)
 
-    cur_key = _reg_path(remote_path)
+    cur_key = _reg_path(remote_path, is_single_file=False)
     rows = [
-        [InlineKeyboardButton(f"📥 Download This Folder ({ft_short})", callback_data=f"dl:open:{cur_key}")]
+        [
+            InlineKeyboardButton(f"📥 Download Folder ({ft_short})", callback_data=f"dl:open:{cur_key}"),
+            InlineKeyboardButton("📄 View Files", callback_data=f"br:files:{cur_key}:0"),
+        ]
     ]
 
     for i in range(0, len(chunk), 2):
         row = []
         for d in chunk[i:i + 2]:
             sub_path = f"{remote_path}{d}" if remote_path.endswith(":") else f"{remote_path}/{d}"
-            sub_key = _reg_path(sub_path)
+            sub_key = _reg_path(sub_path, is_single_file=False)
             label = d if len(d) <= 18 else d[:16] + "…"
             row.append(InlineKeyboardButton(f"📁 {label}", callback_data=f"br:dir:{sub_key}:0"))
         rows.append(row)
@@ -3133,48 +3588,115 @@ async def _build_remotes_browser(remote_path: str = "", page: int = 0) -> tuple[
         if not r_rest:
             rows.append([
                 InlineKeyboardButton("⬆️ Remotes", callback_data="nav:remotes:0"),
+                InlineKeyboardButton(f"🎯 Types: {ft_short}", callback_data=f"nav:filetypes:b_{cur_key}"),
                 InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
             ])
         else:
             parent_rest = r_rest.rsplit("/", 1)[0] if "/" in r_rest else ""
             parent_path = f"{r_prefix}:{parent_rest}" if parent_rest else f"{r_prefix}:"
-            p_key = _reg_path(parent_path)
+            p_key = _reg_path(parent_path, is_single_file=False)
             rows.append([
                 InlineKeyboardButton("⬆️ Back", callback_data=f"br:dir:{p_key}:0"),
-                InlineKeyboardButton("🗂 Remotes", callback_data="nav:remotes:0"),
+                InlineKeyboardButton(f"🎯 Types: {ft_short}", callback_data=f"nav:filetypes:b_{cur_key}"),
                 InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
             ])
 
     err_banner = f"\n⚠️ `{err_msg[:120]}`" if err_msg else ""
     text = (
-        f"🗂 **Remote Browser**\n"
-        f"📍 `{remote_path}` ({len(dirs)} folders)\n"
-        f"🎯 Filter: `{ft_badge}`{err_banner}"
+        f"🗂 **Remote Folder Browser**\n"
+        f"📍 `{remote_path}` (`{len(dirs)}` subfolders)\n"
+        f"🎯 Filter: `{ft_badge}`{err_banner}\n\n"
+        f"_Tap a subfolder, **📄 View Files** to pick individual files, or **📥 Download Folder**:_"
     )
     return text, InlineKeyboardMarkup(rows)
 
 
-# ── 12. Telegram Command Handlers & Auto-Registered Commands ──────────────────
+async def _build_files_browser(remote_path: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
+    """Browse individual files inside `remote_path` and trigger 1-tap single-file transfers."""
+    PAGE_SIZE = 8
+    remote_path = _normalize_remote_path(remote_path)
+    file_entries, err_msg = await rclone_list_folder_files(remote_path)
+    total_pages = max(1, (len(file_entries) + PAGE_SIZE - 1) // PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    chunk = file_entries[page * PAGE_SIZE:(page + 1) * PAGE_SIZE]
+
+    with state_lock:
+        ft_short = _fmt_file_types_short(enabled_file_types)
+        ft_badge = _fmt_file_types_badge(enabled_file_types)
+
+    cur_key = _reg_path(remote_path, is_single_file=False)
+    rows = [
+        [
+            InlineKeyboardButton(f"📥 Download All ({len(file_entries)})", callback_data=f"dl:open:{cur_key}"),
+            InlineKeyboardButton("📁 View Folders", callback_data=f"br:dir:{cur_key}:0"),
+        ]
+    ]
+
+    for fname, fsize in chunk:
+        full_file_path = f"{remote_path}{fname}" if remote_path.endswith(":") else f"{remote_path}/{fname}"
+        fkey = _reg_path(full_file_path, is_single_file=True)
+        cat = _classify_file_ext(fname) or "document"
+        icon = "🎬" if cat == "video" else ("🖼" if cat == "image" else "📄")
+        short_name = fname if len(fname) <= 24 else fname[:21] + "…"
+        rows.append([
+            InlineKeyboardButton(
+                f"{icon} {short_name} ({fmt_size(fsize)})",
+                callback_data=f"dl:file:{fkey}",
+            )
+        ])
+
+    if total_pages > 1:
+        nav_row = []
+        if page > 0:
+            nav_row.append(InlineKeyboardButton("⬅️", callback_data=f"br:files:{cur_key}:{page - 1}"))
+        nav_row.append(InlineKeyboardButton(f"{page + 1}/{total_pages}", callback_data="noop"))
+        if page < total_pages - 1:
+            nav_row.append(InlineKeyboardButton("➡️", callback_data=f"br:files:{cur_key}:{page + 1}"))
+        rows.append(nav_row)
+
+    rows.append([
+        InlineKeyboardButton("⬅️ Folders", callback_data=f"br:dir:{cur_key}:0"),
+        InlineKeyboardButton(f"🎯 Types: {ft_short}", callback_data=f"nav:filetypes:f_{cur_key}"),
+        InlineKeyboardButton("🏠 Home", callback_data="nav:home"),
+    ])
+
+    err_banner = f"\n⚠️ `{err_msg[:120]}`" if err_msg else ""
+    text = (
+        f"📄 **Files in Folder**\n"
+        f"📍 `{remote_path}` (`{len(file_entries)}` matching files)\n"
+        f"🎯 Filter: `{ft_badge}`{err_banner}\n\n"
+        f"_Tap any file below to transfer or manage it individually:_"
+    )
+    return text, InlineKeyboardMarkup(rows)
+
+
+# ==============================================================================
+#  STEP 13: Command Handlers, Interactive Input Handler & Callback Router
+# ==============================================================================
 BOT_COMMANDS = [
-    BotCommand("start", "🏠 Main menu"),
+    BotCommand("start", "🏠 Main control dashboard"),
     BotCommand("dl", "📥 Download from rclone remote"),
-    BotCommand("remotes", "🗂 Browse rclone remotes & folders"),
+    BotCommand("remotes", "🗂 Browse rclone remotes, folders & files"),
     BotCommand("filetypes", "🎯 Filter file types: videos, images, document"),
     BotCommand("concurrent", "⚡ Speed & Concurrency setup"),
-    BotCommand("status", "📊 Live bot stats & resources"),
-    BotCommand("settings", "⚙️ Bot settings"),
+    BotCommand("settings", "⚙️ Full Bot Control Panel"),
+    BotCommand("setdump", "📢 Set Dump Chat / Channel ID"),
+    BotCommand("setrclone", "🔧 Manage rclone.conf (upload/paste/download)"),
+    BotCommand("setmode", "📤 Toggle default mode (Media / Document)"),
+    BotCommand("setdelete", "🗑 Toggle remote auto-delete (on/off)"),
+    BotCommand("setmaxsize", "📏 Set max file size cap (MB)"),
+    BotCommand("setsplit", "✂️ Set split threshold (MB)"),
+    BotCommand("setbwlimit", "🚦 Set bandwidth limit"),
+    BotCommand("setflags", "🚩 Set custom rclone flags"),
+    BotCommand("setrefresh", "⏱ Set progress refresh rate (2-30s)"),
+    BotCommand("status", "📊 Live bot stats & cleanup tools"),
     BotCommand("db", "🗄 MongoDB status & sync"),
     BotCommand("resume", "▶️ Resume unfinished job"),
     BotCommand("queue", "🔄 View active transfer queue"),
     BotCommand("retry", "🔁 Retry failed files"),
-    BotCommand("setrclone", "🔧 Upload rclone.conf"),
-    BotCommand("setdelete", "🗑 Toggle remote auto-delete (on/off)"),
-    BotCommand("setmaxsize", "📏 Set max file size cap (MB)"),
-    BotCommand("setbwlimit", "🚦 Set bandwidth limit"),
-    BotCommand("setrefresh", "⏱ Set progress refresh rate (2-30s)"),
     BotCommand("auth", "👥 Manage authorized user IDs"),
     BotCommand("logs", "📜 View recent bot logs"),
-    BotCommand("cancel", "🛑 Stop job after active files"),
+    BotCommand("cancel", "🛑 Stop job or cancel input prompt"),
     BotCommand("forcestop", "⛔ Kill active transfers immediately"),
     BotCommand("restart", "🔄 Save & restart bot"),
     BotCommand("stop", "🔌 Shut down the bot"),
@@ -3199,8 +3721,27 @@ async def register_bot_commands_auto() -> bool:
     return ok
 
 
+def _validate_rclone_conf_text(text: str) -> list[str]:
+    remotes = re.findall(r"^\[([^\]]+)\]", text, re.MULTILINE)
+    if not remotes:
+        raise ValueError("No `[remote]` sections found in config.")
+    return remotes
+
+
+async def _apply_new_rclone_conf(text: str, source: str = "telegram_upload") -> list[str]:
+    remotes = _validate_rclone_conf_text(text)
+    RCLONE_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
+    if _safe_conf_exists():
+        shutil.copy2(RCLONE_CONF_PATH, RCLONE_CONF_PATH.with_suffix(".conf.bak"))
+    RCLONE_CONF_PATH.write_text(text, encoding="utf-8")
+    os.environ["RCLONE_CONFIG"] = str(RCLONE_CONF_PATH)
+    await db_mgr.save_rclone_conf(text, source=source)
+    return remotes
+
+
 @app.on_message(filters.command(["start", "help"]) & auth_filter)
 async def cmd_start(_, msg: Message):
+    awaiting_input.pop(msg.from_user.id, None)
     await msg.reply(_build_home_text(), reply_markup=home_keyboard())
 
 
@@ -3226,6 +3767,73 @@ async def cmd_filetypes(_, msg: Message):
     await msg.reply(_build_filetypes_text(), reply_markup=filetypes_keyboard())
 
 
+@app.on_message(filters.command("setdump") & auth_filter)
+async def cmd_setdump(_, msg: Message):
+    global DUMP_CHAT_ID
+    if len(msg.command) >= 2:
+        arg = msg.command[1].strip().lower()
+        if arg in ("here", "this"):
+            with state_lock:
+                DUMP_CHAT_ID = msg.chat.id
+            await db_mgr.save_all()
+        elif arg in ("owner", "me", "dm"):
+            with state_lock:
+                DUMP_CHAT_ID = OWNER_ID
+            await db_mgr.save_all()
+        else:
+            try:
+                val = int(arg)
+                with state_lock:
+                    DUMP_CHAT_ID = val
+                await db_mgr.save_all()
+            except ValueError:
+                await msg.reply("❌ Usage: `/setdump -1001234567890` or `/setdump here`")
+                return
+    await msg.reply(_build_dump_chat_text(), reply_markup=dump_chat_keyboard())
+
+
+@app.on_message(filters.command("setmode") & auth_filter)
+async def cmd_setmode(_, msg: Message):
+    global DEFAULT_UPLOAD_MODE
+    with state_lock:
+        if len(msg.command) >= 2 and msg.command[1].lower().startswith("doc"):
+            DEFAULT_UPLOAD_MODE = "document"
+        elif len(msg.command) >= 2 and msg.command[1].lower().startswith(("vid", "med")):
+            DEFAULT_UPLOAD_MODE = "video"
+        else:
+            DEFAULT_UPLOAD_MODE = "document" if DEFAULT_UPLOAD_MODE == "video" else "video"
+    await db_mgr.save_all()
+    await msg.reply(_build_settings_text(), reply_markup=settings_keyboard())
+
+
+@app.on_message(filters.command("setsplit") & auth_filter)
+async def cmd_setsplit(_, msg: Message):
+    global SPLIT_SIZE
+    if len(msg.command) >= 2:
+        try:
+            mb = int(msg.command[1].strip())
+            if not 50 <= mb <= 4000:
+                raise ValueError
+            with state_lock:
+                SPLIT_SIZE = mb * 1024 * 1024
+            await db_mgr.save_all()
+        except ValueError:
+            await msg.reply("❌ Usage: `/setsplit <50-4000>` (MB).")
+            return
+    await msg.reply(_build_settings_text(), reply_markup=settings_keyboard())
+
+
+@app.on_message(filters.command("setflags") & auth_filter)
+async def cmd_setflags(_, msg: Message):
+    global RCLONE_FLAGS
+    if len(msg.command) >= 2:
+        raw = msg.text.split(None, 1)[1].strip()
+        with state_lock:
+            RCLONE_FLAGS = "" if raw.lower() in ("off", "none", "clear") else raw
+        await db_mgr.save_all()
+    await msg.reply(_build_flags_manager_text(), reply_markup=flags_manager_keyboard())
+
+
 @app.on_message(filters.command("db") & auth_filter)
 async def cmd_db(_, msg: Message):
     await msg.reply(await _build_db_text(), reply_markup=db_keyboard())
@@ -3233,7 +3841,7 @@ async def cmd_db(_, msg: Message):
 
 @app.on_message(filters.command("resume") & auth_filter)
 async def cmd_resume(_, msg: Message):
-    if active_sessions:
+    if _has_active_session():
         await msg.reply("⚠️ A job is already running.", reply_markup=active_job_keyboard())
         return
     saved = await db_mgr.get_unfinished_job()
@@ -3256,23 +3864,13 @@ async def cmd_auth(_, msg: Message):
                 with state_lock:
                     AUTHORIZED_USERS.discard(uid)
                 await db_mgr.save_all()
-                await msg.reply(f"🗑 Removed `{uid}` from authorized users.")
-                return
             else:
                 with state_lock:
                     AUTHORIZED_USERS.add(uid)
                 await db_mgr.save_all()
-                await msg.reply(f"✅ Added `{uid}` to authorized users.")
-                return
         except ValueError:
             pass
-    with state_lock:
-        ulist = "\n".join(f"• `{u}`" + (" _(Owner)_" if u == OWNER_ID else "") for u in sorted(AUTHORIZED_USERS))
-    await msg.reply(
-        f"👥 **Authorized Users**\n\n{ulist}\n\n"
-        f"Usage: `/auth <user_id>` or `/auth -<user_id>`",
-        reply_markup=home_keyboard(),
-    )
+    await msg.reply(_build_users_manager_text(), reply_markup=users_manager_keyboard())
 
 
 @app.on_message(filters.command("remotes") & auth_filter)
@@ -3286,7 +3884,7 @@ async def cmd_remotes(_, msg: Message):
 async def cmd_queue(_, msg: Message):
     with stats_lock:
         cur = list(stats["current_files"])
-    if not active_sessions:
+    if not _has_active_session():
         await msg.reply("📭 **No active transfers right now.**", reply_markup=home_keyboard())
         return
     body = "\n".join(f"• `{f}`" for f in cur) if cur else "_Preparing files…_"
@@ -3306,15 +3904,18 @@ async def cmd_logs(_, msg: Message):
 @app.on_message(filters.command("cancel") & auth_filter)
 async def cmd_cancel(_, msg: Message):
     user_id = msg.from_user.id
-    if user_id in awaiting_rclone_conf:
-        awaiting_rclone_conf.discard(user_id)
-        await msg.reply("❌ `rclone.conf` upload cancelled.", reply_markup=home_keyboard())
+    if user_id in awaiting_input:
+        awaiting_input.pop(user_id, None)
+        await msg.reply("❌ Input prompt cancelled.", reply_markup=home_keyboard())
         return
-    if not active_sessions:
+    if not _has_active_session():
         await msg.reply("ℹ️ No active job to cancel.", reply_markup=home_keyboard())
         return
-    for uid in list(active_sessions):
-        cancel_flags[uid] = True
+    with state_lock:
+        sessions = list(active_sessions)
+        for uid in sessions:
+            cancel_flags[uid] = True
+    for uid in sessions:
         if uid in active_boards:
             active_boards[uid].mark_dirty()
     await msg.reply(
@@ -3327,14 +3928,15 @@ async def cmd_cancel(_, msg: Message):
 
 @app.on_message(filters.command("forcestop") & auth_filter)
 async def cmd_forcestop(_, msg: Message):
-    if not active_sessions:
+    if not _has_active_session():
         await msg.reply("ℹ️ No active job is running.", reply_markup=home_keyboard())
         return
-    total_killed = 0
-    for uid in list(active_sessions):
-        cancel_flags[uid] = True
-        force_kill_flags[uid] = True
-        total_killed += kill_user_procs(uid)
+    with state_lock:
+        sessions = list(active_sessions)
+        for uid in sessions:
+            cancel_flags[uid] = True
+            force_kill_flags[uid] = True
+    total_killed = sum(kill_user_procs(uid) for uid in sessions)
     await db_mgr.clear_active_job()
     await db_mgr.save_all()
     await msg.reply(
@@ -3345,7 +3947,9 @@ async def cmd_forcestop(_, msg: Message):
 
 @app.on_message(filters.command("stop") & auth_filter)
 async def cmd_stop(_, msg: Message):
-    for uid in list(active_sessions):
+    with state_lock:
+        sessions = list(active_sessions)
+    for uid in sessions:
         kill_user_procs(uid)
     await db_mgr.save_all()
     await msg.reply("🔌 **Saved to MongoDB. Shutting down…**")
@@ -3355,7 +3959,9 @@ async def cmd_stop(_, msg: Message):
 
 @app.on_message(filters.command("restart") & auth_filter)
 async def cmd_restart(_, msg: Message):
-    for uid in list(active_sessions):
+    with state_lock:
+        sessions = list(active_sessions)
+    for uid in sessions:
         kill_user_procs(uid)
     await db_mgr.save_all()
     sent = await msg.reply("🔄 **Saving state & restarting…**")
@@ -3468,7 +4074,7 @@ async def cmd_setrefresh(_, msg: Message):
 
 @app.on_message(filters.command("dl") & auth_filter)
 async def cmd_dl(_, msg: Message):
-    if active_sessions:
+    if _has_active_session():
         await msg.reply("⚠️ **A transfer is already running.**", reply_markup=active_job_keyboard())
         return
     if len(msg.command) < 2:
@@ -3489,7 +4095,7 @@ async def cmd_dl(_, msg: Message):
 @app.on_message(filters.command("retry") & auth_filter)
 async def cmd_retry(_, msg: Message):
     user_id = msg.from_user.id
-    if active_sessions:
+    if _has_active_session():
         await msg.reply("⚠️ A transfer is already running.", reply_markup=active_job_keyboard())
         return
     with state_lock:
@@ -3507,75 +4113,199 @@ async def cmd_retry(_, msg: Message):
     await _send_summary(status_msg, results)
 
 
-def _validate_rclone_conf_text(text: str) -> list[str]:
-    remotes = re.findall(r"^\[([^\]]+)\]", text, re.MULTILINE)
-    if not remotes:
-        raise ValueError("No `[remote]` sections found in file.")
-    return remotes
-
-
 @app.on_message(filters.command("setrclone") & auth_filter)
 async def cmd_setrclone(_, msg: Message):
-    if active_sessions:
-        await msg.reply("⚠️ Stop the active job before updating `rclone.conf`.", reply_markup=active_job_keyboard())
-        return
-    user_id = msg.from_user.id
-    awaiting_rclone_conf.add(user_id)
-    await msg.reply(
-        "🔧 **Upload `rclone.conf`**\n\n"
-        "Send your `rclone.conf` file as a document. It will be activated and saved to MongoDB.",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("❌ Cancel", callback_data="action:cancel_rclone")]
-        ]),
-    )
+    text, remotes = await _build_rclone_manager_text()
+    await msg.reply(text, reply_markup=rclone_manager_keyboard(remotes))
 
 
 @app.on_message(filters.document & auth_filter)
-async def on_rclone_conf_document(_, msg: Message):
+async def on_document_upload(_, msg: Message):
+    """Accept `rclone.conf` either when prompted or whenever a `.conf` file is sent."""
     user_id = msg.from_user.id
-    if user_id not in awaiting_rclone_conf:
+    doc = msg.document
+    fname = (getattr(doc, "file_name", "") or "").lower()
+    state = awaiting_input.get(user_id, {})
+
+    if state.get("kind") != "rclone_conf" and not fname.endswith(".conf"):
         return
 
-    awaiting_rclone_conf.discard(user_id)
-    doc = msg.document
+    if _has_active_session():
+        await msg.reply("⚠️ Stop the active job before updating `rclone.conf`.", reply_markup=active_job_keyboard())
+        return
+
+    awaiting_input.pop(user_id, None)
     if doc.file_size and doc.file_size > 1024 * 1024:
         await msg.reply("❌ File is too large (>1 MB) for `rclone.conf`.", reply_markup=home_keyboard())
         return
 
-    status = await msg.reply("⬇️ _Saving `rclone.conf` to MongoDB…_")
+    status = await msg.reply("⬇️ _Validating & saving `rclone.conf` to MongoDB…_")
     tmp_path = os.path.join(DOWNLOAD_DIR, f"rclone_upload_{user_id}_{int(time.time())}.conf")
     try:
         await msg.download(file_name=tmp_path)
         text = Path(tmp_path).read_text(encoding="utf-8", errors="strict")
-        remotes = _validate_rclone_conf_text(text)
-
-        RCLONE_CONF_PATH.parent.mkdir(parents=True, exist_ok=True)
-        if RCLONE_CONF_PATH.exists():
-            shutil.copy2(RCLONE_CONF_PATH, RCLONE_CONF_PATH.with_suffix(".conf.bak"))
-        RCLONE_CONF_PATH.write_text(text, encoding="utf-8")
-        os.environ["RCLONE_CONFIG"] = str(RCLONE_CONF_PATH)
-        await db_mgr.save_rclone_conf(text, source="telegram_upload")
+        remotes = await _apply_new_rclone_conf(text, source="telegram_upload")
     except Exception as e:
         await safe_edit(status, f"❌ **Invalid `rclone.conf`:**\n`{e}`", reply_markup=home_keyboard())
         return
     finally:
         Path(tmp_path).unlink(missing_ok=True)
 
-    remote_list = ", ".join(f"`{r}`" for r in remotes[:12])
+    mgr_text, rem_list = await _build_rclone_manager_text()
     await safe_edit(
         status,
-        f"✅ **`rclone.conf` Saved!** (`{len(remotes)}` remotes)\n{remote_list}",
-        reply_markup=home_keyboard(),
+        f"✅ **`rclone.conf` Saved!** (`{len(remotes)}` remotes)\n\n" + mgr_text,
+        reply_markup=rclone_manager_keyboard(rem_list),
     )
 
 
-# ── 13. Unified Callback Query Router ────────────────────────────────────────
+@app.on_message(interactive_input_filter)
+async def on_interactive_input(_, msg: Message):
+    """Handles interactive bot-side prompts (Dump Chat, Rclone Config paste, Custom Cap, Split, BW, Flags, Add User)."""
+    global DUMP_CHAT_ID, max_size_bytes, max_size_enabled, SPLIT_SIZE, BW_LIMIT, RCLONE_FLAGS
+
+    user_id = msg.from_user.id
+    state = awaiting_input.pop(user_id, None)
+    if not state:
+        return
+
+    kind = state.get("kind")
+    raw_text = (getattr(msg, "text", None) or getattr(msg, "caption", None) or "").strip()
+
+    if kind == "rclone_conf":
+        if not raw_text:
+            text, rem_list = await _build_rclone_manager_text()
+            await msg.reply(
+                "❌ Please send `rclone.conf` as a file or paste its `[remote]` text.\n\n" + text,
+                reply_markup=rclone_manager_keyboard(rem_list),
+            )
+            return
+        try:
+            remotes = await _apply_new_rclone_conf(raw_text, source="telegram_upload")
+            mgr_text, rem_list = await _build_rclone_manager_text()
+            await msg.reply(
+                f"✅ **`rclone.conf` Saved from Text!** (`{len(remotes)}` remotes)\n\n" + mgr_text,
+                reply_markup=rclone_manager_keyboard(rem_list),
+            )
+        except Exception as e:
+            text, rem_list = await _build_rclone_manager_text()
+            await msg.reply(
+                f"❌ **Invalid `rclone.conf` text:** `{e}`\n\n" + text,
+                reply_markup=rclone_manager_keyboard(rem_list),
+            )
+        return
+
+    if kind == "dump_chat":
+        fwd_id = _extract_forwarded_chat_id(msg)
+        if fwd_id is not None:
+            new_id = fwd_id
+        else:
+            try:
+                new_id = int(raw_text)
+            except ValueError:
+                await msg.reply(
+                    "❌ Invalid Chat ID. Send a numeric ID like `-1001234567890` or forward a message from the target channel.",
+                    reply_markup=dump_chat_keyboard(),
+                )
+                return
+        with state_lock:
+            DUMP_CHAT_ID = new_id
+        await db_mgr.save_all()
+        await msg.reply(
+            f"✅ **Dump Chat updated to `{new_id}`!**\n\n" + _build_dump_chat_text(),
+            reply_markup=dump_chat_keyboard(),
+        )
+        return
+
+    if kind == "max_size":
+        try:
+            mb = int(raw_text.lower().replace("mb", "").replace("m", "").strip())
+            if mb <= 0:
+                raise ValueError
+            with state_lock:
+                max_size_bytes = mb * 1024 * 1024
+                max_size_enabled = True
+            await db_mgr.save_all()
+            await msg.reply(
+                f"✅ **Max File Size Cap set to `{mb} MB`!**\n\n" + _build_settings_text(),
+                reply_markup=settings_keyboard(),
+            )
+        except ValueError:
+            await msg.reply("❌ Send a positive number in MB (e.g. `1500`).", reply_markup=settings_keyboard())
+        return
+
+    if kind == "split_size":
+        try:
+            mb = int(raw_text.lower().replace("mb", "").replace("m", "").strip())
+            if not 50 <= mb <= 4000:
+                raise ValueError
+            with state_lock:
+                SPLIT_SIZE = mb * 1024 * 1024
+            await db_mgr.save_all()
+            await msg.reply(
+                f"✅ **Split Threshold set to `{mb} MB`!**\n\n" + _build_settings_text(),
+                reply_markup=settings_keyboard(),
+            )
+        except ValueError:
+            await msg.reply("❌ Send a split threshold between `50` and `4000` MB.", reply_markup=settings_keyboard())
+        return
+
+    if kind == "bw_limit":
+        if raw_text.lower() in ("off", "none", "0", "unlimited"):
+            with state_lock:
+                BW_LIMIT = ""
+            await db_mgr.save_all()
+            await msg.reply(
+                "✅ **Bandwidth Limit disabled (Unlimited)!**\n\n" + _build_settings_text(),
+                reply_markup=settings_keyboard(),
+            )
+        elif re.fullmatch(r"\d+(\.\d+)?[kKmMgG]?", raw_text):
+            with state_lock:
+                BW_LIMIT = raw_text
+            await db_mgr.save_all()
+            await msg.reply(
+                f"✅ **Bandwidth Limit set to `{raw_text}`!**\n\n" + _build_settings_text(),
+                reply_markup=settings_keyboard(),
+            )
+        else:
+            await msg.reply("❌ Invalid bandwidth limit. Examples: `10M`, `50M`, or `off`.", reply_markup=settings_keyboard())
+        return
+
+    if kind == "rclone_flags":
+        with state_lock:
+            RCLONE_FLAGS = "" if raw_text.lower() in ("off", "none", "clear") else raw_text
+        await db_mgr.save_all()
+        await msg.reply(
+            "✅ **Rclone Flags updated!**\n\n" + _build_flags_manager_text(),
+            reply_markup=flags_manager_keyboard(),
+        )
+        return
+
+    if kind == "add_user":
+        if user_id != OWNER_ID:
+            await msg.reply("⛔ Only the owner can add users.")
+            return
+        try:
+            new_uid = int(raw_text.lstrip("+"))
+            with state_lock:
+                AUTHORIZED_USERS.add(new_uid)
+            await db_mgr.save_all()
+            await msg.reply(
+                f"✅ **Added `{new_uid}` to Authorized Users!**\n\n" + _build_users_manager_text(),
+                reply_markup=users_manager_keyboard(),
+            )
+        except ValueError:
+            await msg.reply("❌ Send a valid numeric Telegram User ID.", reply_markup=users_manager_keyboard())
+        return
+
+
+# ── Unified Callback Query Router ────────────────────────────────────────────
 @app.on_callback_query(auth_filter)
 async def on_callback(_, cq: CallbackQuery):
     global delete_after_upload, max_size_enabled, max_size_bytes, enabled_file_types
     global CONCURRENT_JOBS, UPLOAD_WORKERS, RCLONE_STREAMS, RCLONE_BUFFER_SIZE
-    global BW_LIMIT, BOARD_REFRESH_INTERVAL
-    global AUTO_RESUME_JOBS, DEFAULT_UPLOAD_MODE
+    global BW_LIMIT, RCLONE_FLAGS, BOARD_REFRESH_INTERVAL
+    global SPLIT_SIZE, AUTO_RESUME_JOBS, DEFAULT_UPLOAD_MODE, DUMP_CHAT_ID
 
     data = cq.data or ""
     user_id = cq.from_user.id
@@ -3585,6 +4315,7 @@ async def on_callback(_, cq: CallbackQuery):
         return
 
     if data == "action:close":
+        awaiting_input.pop(user_id, None)
         await cq.answer("Closed")
         try:
             await cq.message.delete()
@@ -3592,10 +4323,21 @@ async def on_callback(_, cq: CallbackQuery):
             pass
         return
 
-    if data == "action:cancel_rclone":
-        awaiting_rclone_conf.discard(user_id)
+    if data == "action:cancel_input":
+        prev_state = awaiting_input.pop(user_id, None) or {}
+        cancel_nav = prev_state.get("cancel_nav", "nav:settings")
         await cq.answer("Cancelled")
-        await safe_edit(cq.message, _build_home_text(), reply_markup=home_keyboard())
+        if cancel_nav == "nav:rclone":
+            text, remotes = await _build_rclone_manager_text()
+            await safe_edit(cq.message, text, reply_markup=rclone_manager_keyboard(remotes))
+        elif cancel_nav == "nav:dump":
+            await safe_edit(cq.message, _build_dump_chat_text(), reply_markup=dump_chat_keyboard())
+        elif cancel_nav == "nav:flags":
+            await safe_edit(cq.message, _build_flags_manager_text(), reply_markup=flags_manager_keyboard())
+        elif cancel_nav == "nav:users":
+            await safe_edit(cq.message, _build_users_manager_text(), reply_markup=users_manager_keyboard())
+        else:
+            await safe_edit(cq.message, _build_settings_text(), reply_markup=settings_keyboard())
         return
 
     if data == "action:clear_logs":
@@ -3608,8 +4350,47 @@ async def on_callback(_, cq: CallbackQuery):
         )
         return
 
+    if data == "action:clean_temp":
+        if _has_active_session():
+            await cq.answer("⚠️ Cannot clean temp dir while a transfer is active!", show_alert=True)
+            return
+        removed = 0
+        try:
+            for item in Path(DOWNLOAD_DIR).iterdir():
+                if item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+                    removed += 1
+                elif item.is_file():
+                    item.unlink(missing_ok=True)
+                    removed += 1
+        except Exception:
+            pass
+        await cq.answer(f"🧹 Cleaned {removed} temp item(s)!", show_alert=True)
+        await safe_edit(cq.message, _build_status_text(), reply_markup=status_keyboard())
+        return
+
+    if data == "action:reset_stats":
+        with stats_lock:
+            stats["total_done"] = 0
+            stats["total_failed"] = 0
+            stats["total_skipped"] = 0
+            stats["total_bytes"] = 0
+            stats["last_file"] = None
+            stats["last_error"] = None
+            stats["floodwait_count"] = 0
+            stats["floodwait_last_secs"] = 0
+            stats["floodwait_last_time"] = None
+        with state_lock:
+            last_failed.clear()
+        await db_mgr.save_all()
+        await cq.answer("🔄 Transfer statistics reset!", show_alert=True)
+        await safe_edit(cq.message, _build_status_text(), reply_markup=status_keyboard())
+        return
+
     if data == "action:restart_bot":
-        for uid in list(active_sessions):
+        with state_lock:
+            sessions = list(active_sessions)
+        for uid in sessions:
             kill_user_procs(uid)
         await db_mgr.save_all()
         await cq.answer("🔄 Restarting…", show_alert=False)
@@ -3619,8 +4400,20 @@ async def on_callback(_, cq: CallbackQuery):
         os.execv(sys.executable, [sys.executable] + sys.argv)
         return
 
+    if data == "action:stop_bot":
+        with state_lock:
+            sessions = list(active_sessions)
+        for uid in sessions:
+            kill_user_procs(uid)
+        await db_mgr.save_all()
+        await cq.answer("🔌 Shutting down…", show_alert=True)
+        await safe_edit(cq.message, "🔌 **State saved to MongoDB. Bot shut down.**")
+        await _graceful_restart_cleanup()
+        os._exit(0)
+        return
+
     if data == "action:resume_job":
-        if active_sessions:
+        if _has_active_session():
             await cq.answer("⚠️ A job is already running!", show_alert=True)
             return
         saved = await db_mgr.get_unfinished_job()
@@ -3631,9 +4424,94 @@ async def on_callback(_, cq: CallbackQuery):
         asyncio.create_task(_resume_saved_job(saved, notify_chat_id=cq.message.chat.id))
         return
 
-    # ── Navigation callbacks ──
+    # ── Interactive Prompt Triggers (`prompt:...`) ──
+    if data.startswith("prompt:"):
+        pkind = data.split(":", 1)[1]
+        cancel_kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton("❌ Cancel", callback_data="action:cancel_input")]
+        ])
+        if pkind == "rclone_conf":
+            if _has_active_session():
+                await cq.answer("⚠️ Stop the active job first!", show_alert=True)
+                return
+            awaiting_input[user_id] = {"kind": "rclone_conf", "cancel_nav": "nav:rclone"}
+            await cq.answer()
+            await safe_edit(
+                cq.message,
+                "🔧 **Upload or Paste `rclone.conf`**\n\n"
+                "• Send your `rclone.conf` file as a document, **OR**\n"
+                "• Paste your `[remote]` configuration text directly in chat.",
+                reply_markup=cancel_kb,
+            )
+            return
+        if pkind == "dump_chat":
+            awaiting_input[user_id] = {"kind": "dump_chat", "cancel_nav": "nav:dump"}
+            await cq.answer()
+            await safe_edit(
+                cq.message,
+                "📢 **Set Dump Chat / Channel**\n\n"
+                "• Send the numeric Chat ID (e.g. `-1001234567890`), **OR**\n"
+                "• Forward any message from your target channel/group to me now.",
+                reply_markup=cancel_kb,
+            )
+            return
+        if pkind == "max_size":
+            awaiting_input[user_id] = {"kind": "max_size", "cancel_nav": "nav:settings"}
+            await cq.answer()
+            await safe_edit(
+                cq.message,
+                "📏 **Set Custom Max File Size Cap**\n\n"
+                "Send the maximum file size in **MB** (e.g. `1500` or `3500`):",
+                reply_markup=cancel_kb,
+            )
+            return
+        if pkind == "split_size":
+            awaiting_input[user_id] = {"kind": "split_size", "cancel_nav": "nav:settings"}
+            await cq.answer()
+            await safe_edit(
+                cq.message,
+                "✂️ **Set Custom Split Threshold**\n\n"
+                "Send the split threshold in **MB** between `50` and `4000` (e.g. `1950`):",
+                reply_markup=cancel_kb,
+            )
+            return
+        if pkind == "bw_limit":
+            awaiting_input[user_id] = {"kind": "bw_limit", "cancel_nav": "nav:settings"}
+            await cq.answer()
+            await safe_edit(
+                cq.message,
+                "🚦 **Set Custom Bandwidth Limit**\n\n"
+                "Send a limit like `10M`, `50M`, `512K`, or `off` for unlimited:",
+                reply_markup=cancel_kb,
+            )
+            return
+        if pkind == "rclone_flags":
+            awaiting_input[user_id] = {"kind": "rclone_flags", "cancel_nav": "nav:flags"}
+            await cq.answer()
+            await safe_edit(
+                cq.message,
+                "🚩 **Set Custom Rclone Flags**\n\n"
+                "Send the extra flags to pass to `rclone` (e.g. `--drive-chunk-size 64M --fast-list`) or `clear`:",
+                reply_markup=cancel_kb,
+            )
+            return
+        if pkind == "add_user":
+            if user_id != OWNER_ID:
+                await cq.answer("⛔ Only the bot owner can manage users.", show_alert=True)
+                return
+            awaiting_input[user_id] = {"kind": "add_user", "cancel_nav": "nav:users"}
+            await cq.answer()
+            await safe_edit(
+                cq.message,
+                "👥 **Add Authorized User**\n\n"
+                "Send the numeric Telegram User ID to authorize:",
+                reply_markup=cancel_kb,
+            )
+            return
+
+    # ── Navigation callbacks (`nav:...`) ──
     if data == "nav:home":
-        awaiting_rclone_conf.discard(user_id)
+        awaiting_input.pop(user_id, None)
         await cq.answer()
         await safe_edit(cq.message, _build_home_text(), reply_markup=home_keyboard())
         return
@@ -3644,22 +4522,51 @@ async def on_callback(_, cq: CallbackQuery):
         return
 
     if data == "nav:settings":
+        awaiting_input.pop(user_id, None)
         await cq.answer()
         await safe_edit(cq.message, _build_settings_text(), reply_markup=settings_keyboard())
         return
 
-    if data.startswith("nav:filetypes"):
-        parts = data.split(":")
-        ret_key = parts[2] if len(parts) >= 3 else ""
+    if data == "nav:dump":
+        awaiting_input.pop(user_id, None)
         await cq.answer()
-        await safe_edit(cq.message, _build_filetypes_text(), reply_markup=filetypes_keyboard(ret_key))
+        await safe_edit(cq.message, _build_dump_chat_text(), reply_markup=dump_chat_keyboard())
+        return
+
+    if data in ("nav:rclone", "nav:setrclone"):
+        awaiting_input.pop(user_id, None)
+        await cq.answer()
+        text, remotes = await _build_rclone_manager_text()
+        await safe_edit(cq.message, text, reply_markup=rclone_manager_keyboard(remotes))
+        return
+
+    if data == "nav:users":
+        if user_id != OWNER_ID:
+            await cq.answer("⛔ Owner only.", show_alert=True)
+            return
+        awaiting_input.pop(user_id, None)
+        await cq.answer()
+        await safe_edit(cq.message, _build_users_manager_text(), reply_markup=users_manager_keyboard())
+        return
+
+    if data == "nav:flags":
+        awaiting_input.pop(user_id, None)
+        await cq.answer()
+        await safe_edit(cq.message, _build_flags_manager_text(), reply_markup=flags_manager_keyboard())
+        return
+
+    if data.startswith("nav:filetypes"):
+        parts = data.split(":", 2)
+        ret_tag = parts[2] if len(parts) >= 3 else ""
+        await cq.answer()
+        await safe_edit(cq.message, _build_filetypes_text(), reply_markup=filetypes_keyboard(ret_tag))
         return
 
     if data.startswith("nav:concurrent"):
-        parts = data.split(":")
-        ret_key = parts[2] if len(parts) >= 3 else ""
+        parts = data.split(":", 2)
+        ret_tag = parts[2] if len(parts) >= 3 else ""
         await cq.answer()
-        await safe_edit(cq.message, _build_concurrent_text(), reply_markup=concurrent_keyboard(ret_key))
+        await safe_edit(cq.message, _build_concurrent_text(), reply_markup=concurrent_keyboard(ret_tag))
         return
 
     if data == "nav:db":
@@ -3668,7 +4575,7 @@ async def on_callback(_, cq: CallbackQuery):
         return
 
     if data == "nav:queue":
-        if not active_sessions:
+        if not _has_active_session():
             await cq.answer("No active job right now.")
             await safe_edit(cq.message, _build_home_text(), reply_markup=home_keyboard())
             return
@@ -3698,22 +4605,6 @@ async def on_callback(_, cq: CallbackQuery):
         )
         return
 
-    if data == "nav:setrclone":
-        if active_sessions:
-            await cq.answer("⚠️ Stop the active job first!", show_alert=True)
-            return
-        awaiting_rclone_conf.add(user_id)
-        await cq.answer()
-        await safe_edit(
-            cq.message,
-            "🔧 **Upload `rclone.conf`**\n\n"
-            "Send your `rclone.conf` file now as a document.",
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton("❌ Cancel", callback_data="action:cancel_rclone")]
-            ]),
-        )
-        return
-
     if data.startswith("nav:remotes:"):
         try:
             page = int(data.split(":")[2])
@@ -3724,16 +4615,118 @@ async def on_callback(_, cq: CallbackQuery):
         await safe_edit(cq.message, text, reply_markup=kb)
         return
 
+    # ── Dump Chat callbacks (`dump:...`) ──
+    if data.startswith("dump:"):
+        sub = data.split(":", 1)[1]
+        if sub == "here":
+            with state_lock:
+                DUMP_CHAT_ID = cq.message.chat.id
+            await db_mgr.save_all()
+            await cq.answer(f"📢 Dump Chat set to {DUMP_CHAT_ID}!")
+        elif sub == "owner":
+            with state_lock:
+                DUMP_CHAT_ID = OWNER_ID
+            await db_mgr.save_all()
+            await cq.answer(f"👤 Dump Chat set to Owner ({OWNER_ID})!")
+        elif sub == "test":
+            with state_lock:
+                target = DUMP_CHAT_ID
+            try:
+                await app.send_message(target, "✅ **Rclone Bot Test:** Upload destination is working!")
+                await cq.answer(f"✅ Test message sent to {target}!", show_alert=True)
+            except Exception as e:
+                await cq.answer(f"❌ Failed to send to {target}: {str(e)[:120]}", show_alert=True)
+            return
+        await safe_edit(cq.message, _build_dump_chat_text(), reply_markup=dump_chat_keyboard())
+        return
+
+    # ── Rclone Config Manager callbacks (`rc:...`) ──
+    if data.startswith("rc:"):
+        parts = data.split(":")
+        sub = parts[1]
+        if sub == "download":
+            if not _safe_conf_exists():
+                await cq.answer("⚠️ No rclone.conf file on disk.", show_alert=True)
+                return
+            await cq.answer("📥 Sending rclone.conf…")
+            try:
+                await app.send_document(
+                    cq.message.chat.id,
+                    str(RCLONE_CONF_PATH),
+                    caption="🔧 **Active `rclone.conf`**",
+                )
+            except Exception as e:
+                await cq.answer(f"❌ Error: {e}", show_alert=True)
+            return
+        if sub == "del" and len(parts) >= 3:
+            if _has_active_session():
+                await cq.answer("⚠️ Stop the active job before editing remotes!", show_alert=True)
+                return
+            rname = _get_path(parts[2])
+            if not rname or not _safe_conf_exists():
+                await cq.answer("⚠️ Remote not found.", show_alert=True)
+                return
+            try:
+                cur_text = RCLONE_CONF_PATH.read_text(encoding="utf-8")
+                new_text = _remove_rclone_remote_section(cur_text, rname)
+                RCLONE_CONF_PATH.write_text(new_text, encoding="utf-8")
+                await db_mgr.save_rclone_conf(new_text, source="bot_edit")
+                await cq.answer(f"🗑 Deleted remote [{rname}]")
+            except Exception as e:
+                await cq.answer(f"❌ Error: {e}", show_alert=True)
+            text, remotes = await _build_rclone_manager_text()
+            await safe_edit(cq.message, text, reply_markup=rclone_manager_keyboard(remotes))
+            return
+
+    # ── Users Manager callbacks (`usr:...`) ──
+    if data.startswith("usr:del:"):
+        if user_id != OWNER_ID:
+            await cq.answer("⛔ Owner only.", show_alert=True)
+            return
+        try:
+            rem_uid = int(data.split(":")[2])
+            if rem_uid != OWNER_ID:
+                with state_lock:
+                    AUTHORIZED_USERS.discard(rem_uid)
+                await db_mgr.save_all()
+                await cq.answer(f"🗑 Removed {rem_uid}")
+        except ValueError:
+            pass
+        await safe_edit(cq.message, _build_users_manager_text(), reply_markup=users_manager_keyboard())
+        return
+
+    # ── Rclone Flags Manager callbacks (`flg:...`) ──
+    if data.startswith("flg:"):
+        sub = data.split(":", 2)[1]
+        if sub == "clear":
+            with state_lock:
+                RCLONE_FLAGS = ""
+            await db_mgr.save_all()
+            await cq.answer("🧹 Cleared all flags")
+        elif sub == "toggle":
+            flag_str = data.split(":", 2)[2]
+            tokens = _rclone_extra_flags()
+            if flag_str in tokens:
+                tokens = [t for t in tokens if t != flag_str]
+            else:
+                tokens.append(flag_str)
+            with state_lock:
+                RCLONE_FLAGS = " ".join(tokens)
+            await db_mgr.save_all()
+            await cq.answer(f"🚩 Flags: {RCLONE_FLAGS or 'None'}")
+        await safe_edit(cq.message, _build_flags_manager_text(), reply_markup=flags_manager_keyboard())
+        return
+
     # ── File Types Filter Panel callbacks (`ft:...`) ──
     if data.startswith("ft:"):
-        parts = data.split(":")
+        parts = data.split(":", 3)
         sub = parts[1]
         if sub in ("only", "preset", "toggle"):
             target = parts[2]
-            ret_key = parts[3] if len(parts) >= 4 else ""
+            ret_tag = parts[3] if len(parts) >= 4 else ""
         else:
             target = ""
-            ret_key = parts[2] if len(parts) >= 3 else ""
+            ret_tag = parts[2] if len(parts) >= 3 else ""
 
         if sub == "only" and target in ALL_FILE_TYPE_KEYS:
             with state_lock:
@@ -3763,17 +4756,17 @@ async def on_callback(_, cq: CallbackQuery):
             await db_mgr.save_all()
             await cq.answer(f"🎯 Filter: {badge}")
 
-        await safe_edit(cq.message, _build_filetypes_text(), reply_markup=filetypes_keyboard(ret_key))
+        await safe_edit(cq.message, _build_filetypes_text(), reply_markup=filetypes_keyboard(ret_tag))
         return
 
     # ── Speed & Concurrency Setup callbacks (`conc:...`) ──
     if data.startswith("conc:"):
-        parts = data.split(":")
+        parts = data.split(":", 3)
         sub = parts[1]
         if sub in ("preset", "jobs", "upw", "streams", "buf"):
-            ret_key = parts[3] if len(parts) >= 4 else ""
+            ret_tag = parts[3] if len(parts) >= 4 else ""
         else:
-            ret_key = parts[2] if len(parts) >= 3 else ""
+            ret_tag = parts[2] if len(parts) >= 3 else ""
 
         if sub == "preset":
             pname = parts[2]
@@ -3828,15 +4821,15 @@ async def on_callback(_, cq: CallbackQuery):
             await db_mgr.save_all()
             await cq.answer(f"📦 Buffer: {b_val}")
 
-        await safe_edit(cq.message, _build_concurrent_text(), reply_markup=concurrent_keyboard(ret_key))
+        await safe_edit(cq.message, _build_concurrent_text(), reply_markup=concurrent_keyboard(ret_tag))
         return
 
-    # ── MongoDB Panel callbacks ──
+    # ── MongoDB Panel callbacks (`db:...`) ──
     if data.startswith("db:"):
         sub = data.split(":", 1)[1]
         if sub == "save":
             await db_mgr.save_all()
-            if RCLONE_CONF_PATH.exists():
+            if _safe_conf_exists():
                 try:
                     await db_mgr.save_rclone_conf(RCLONE_CONF_PATH.read_text(encoding="utf-8"), source="manual_sync")
                 except Exception:
@@ -3851,7 +4844,7 @@ async def on_callback(_, cq: CallbackQuery):
         await safe_edit(cq.message, await _build_db_text(), reply_markup=db_keyboard())
         return
 
-    # ── Folder Browser callbacks ──
+    # ── Folder & File Browser callbacks (`br:...`) ──
     if data.startswith("br:dir:"):
         _, _, key, page_s = data.split(":", 3)
         rpath = _get_path(key)
@@ -3869,7 +4862,24 @@ async def on_callback(_, cq: CallbackQuery):
         await safe_edit(cq.message, text, reply_markup=kb)
         return
 
-    # ── Settings Panel callbacks ──
+    if data.startswith("br:files:"):
+        _, _, key, page_s = data.split(":", 3)
+        rpath = _get_path(key)
+        if not rpath:
+            await cq.answer("Session expired — reloading remotes")
+            text, kb = await _build_remotes_browser("", 0)
+            await safe_edit(cq.message, text, reply_markup=kb)
+            return
+        try:
+            pg = int(page_s)
+        except ValueError:
+            pg = 0
+        await cq.answer("Loading files…")
+        text, kb = await _build_files_browser(rpath, pg)
+        await safe_edit(cq.message, text, reply_markup=kb)
+        return
+
+    # ── Settings Panel callbacks (`cfg:...`) ──
     if data.startswith("cfg:"):
         action = data.split(":", 1)[1]
         if action == "toggle_del":
@@ -3884,6 +4894,12 @@ async def on_callback(_, cq: CallbackQuery):
                 state_str = "ON 🟢" if AUTO_RESUME_JOBS else "OFF 🔴"
             await db_mgr.save_all()
             await cq.answer(f"▶️ Auto-Resume: {state_str}")
+        elif action == "toggle_mode":
+            with state_lock:
+                DEFAULT_UPLOAD_MODE = "document" if DEFAULT_UPLOAD_MODE == "video" else "video"
+                m_str = "🎬 Media" if DEFAULT_UPLOAD_MODE == "video" else "📄 Document"
+            await db_mgr.save_all()
+            await cq.answer(f"📤 Default Mode: {m_str}")
         elif action == "toggle_size":
             with state_lock:
                 max_size_enabled = not max_size_enabled
@@ -3898,6 +4914,13 @@ async def on_callback(_, cq: CallbackQuery):
                 max_size_enabled = True
             await db_mgr.save_all()
             await cq.answer(f"📐 Size Cap: {nxt} MB")
+        elif action == "cycle_split":
+            with state_lock:
+                cur_s_mb = SPLIT_SIZE // (1024 * 1024)
+                nxt_s = _SPLIT_PRESETS_MB[(_SPLIT_PRESETS_MB.index(cur_s_mb) + 1) % len(_SPLIT_PRESETS_MB)] if cur_s_mb in _SPLIT_PRESETS_MB else 2000
+                SPLIT_SIZE = nxt_s * 1024 * 1024
+            await db_mgr.save_all()
+            await cq.answer(f"✂️ Split Threshold: {nxt_s} MB")
         elif action == "cycle_bw":
             with state_lock:
                 idx_bw = _BW_PRESETS.index(BW_LIMIT) if BW_LIMIT in _BW_PRESETS else 0
@@ -3916,7 +4939,7 @@ async def on_callback(_, cq: CallbackQuery):
         await safe_edit(cq.message, _build_settings_text(), reply_markup=settings_keyboard())
         return
 
-    # ── Live Job Control callbacks ──
+    # ── Live Job Control callbacks (`job:...`) ──
     if data == "job:refresh":
         board = active_boards.get(user_id) or next(iter(active_boards.values()), None)
         if board and board.running:
@@ -3927,32 +4950,36 @@ async def on_callback(_, cq: CallbackQuery):
         return
 
     if data == "job:cancel":
-        if not active_sessions:
+        if not _has_active_session():
             await cq.answer("No active job.")
             return
-        for uid in list(active_sessions):
-            cancel_flags[uid] = True
+        with state_lock:
+            sessions = list(active_sessions)
+            for uid in sessions:
+                cancel_flags[uid] = True
+        for uid in sessions:
             if uid in active_boards:
                 active_boards[uid].mark_dirty()
         await cq.answer("🛑 Stopping after current file(s)…", show_alert=True)
         return
 
     if data == "job:kill":
-        if not active_sessions:
+        if not _has_active_session():
             await cq.answer("No active job.")
             return
-        killed = 0
-        for uid in list(active_sessions):
-            cancel_flags[uid] = True
-            force_kill_flags[uid] = True
-            killed += kill_user_procs(uid)
+        with state_lock:
+            sessions = list(active_sessions)
+            for uid in sessions:
+                cancel_flags[uid] = True
+                force_kill_flags[uid] = True
+        killed = sum(kill_user_procs(uid) for uid in sessions)
         await db_mgr.clear_active_job()
         await cq.answer(f"⛔ Killed {killed} process(es).", show_alert=True)
         return
 
-    # ── Retry callback ──
+    # ── Retry callback (`action:retry`) ──
     if data == "action:retry":
-        if active_sessions:
+        if _has_active_session():
             await cq.answer("⚠️ A job is already running!", show_alert=True)
             return
         with state_lock:
@@ -3971,7 +4998,7 @@ async def on_callback(_, cq: CallbackQuery):
         await _send_summary(cq.message, results)
         return
 
-    # ── /dl Launchpad callbacks ──
+    # ── Transfer Launchpad callbacks (`dl:...`) ──
     if data.startswith("dl:"):
         parts = data.split(":")
         sub = parts[1]
@@ -3980,10 +5007,41 @@ async def on_callback(_, cq: CallbackQuery):
         if not remote_path:
             await cq.answer("⚠️ Session expired — please open /remotes again.", show_alert=True)
             return
+        is_single = _is_single_file_key(key)
 
         if sub == "open":
             await cq.answer()
-            await safe_edit(cq.message, _build_dl_prompt_text(remote_path), reply_markup=mode_keyboard(remote_path))
+            await safe_edit(
+                cq.message,
+                _build_dl_prompt_text(remote_path, is_single_file=False),
+                reply_markup=mode_keyboard(remote_path, is_single_file=False),
+            )
+            return
+
+        if sub == "file":
+            await cq.answer()
+            await safe_edit(
+                cq.message,
+                _build_dl_prompt_text(remote_path, is_single_file=True),
+                reply_markup=mode_keyboard(remote_path, is_single_file=True),
+            )
+            return
+
+        if sub == "rmfile":
+            if _has_active_session():
+                await cq.answer("⚠️ Wait for active transfer to finish.", show_alert=True)
+                return
+            try:
+                await rclone_delete(remote_path, user_id=user_id)
+                await cq.answer("🗑 File deleted from remote!", show_alert=True)
+                if ":" in remote_path:
+                    r_prefix, r_rest = remote_path.split(":", 1)
+                    parent_rest = r_rest.strip("/").rsplit("/", 1)[0] if "/" in r_rest.strip("/") else ""
+                    parent_path = f"{r_prefix}:{parent_rest}" if parent_rest else f"{r_prefix}:"
+                    text, kb = await _build_files_browser(parent_path, 0)
+                    await safe_edit(cq.message, text, reply_markup=kb)
+            except Exception as e:
+                await cq.answer(f"❌ Delete failed: {str(e)[:120]}", show_alert=True)
             return
 
         if sub == "ft":
@@ -3996,7 +5054,11 @@ async def on_callback(_, cq: CallbackQuery):
                 badge = _fmt_file_types_badge(enabled_file_types)
             await db_mgr.save_all()
             await cq.answer(f"🎯 Filter: {badge}")
-            await safe_edit(cq.message, _build_dl_prompt_text(remote_path), reply_markup=mode_keyboard(remote_path))
+            await safe_edit(
+                cq.message,
+                _build_dl_prompt_text(remote_path, is_single_file=is_single),
+                reply_markup=mode_keyboard(remote_path, is_single_file=is_single),
+            )
             return
 
         if sub == "del":
@@ -4005,7 +5067,11 @@ async def on_callback(_, cq: CallbackQuery):
                 st = "ON" if delete_after_upload else "OFF"
             await db_mgr.save_all()
             await cq.answer(f"🗑 Auto-Delete: {st}")
-            await safe_edit(cq.message, _build_dl_prompt_text(remote_path), reply_markup=mode_keyboard(remote_path))
+            await safe_edit(
+                cq.message,
+                _build_dl_prompt_text(remote_path, is_single_file=is_single),
+                reply_markup=mode_keyboard(remote_path, is_single_file=is_single),
+            )
             return
 
         if sub == "size":
@@ -4014,13 +5080,17 @@ async def on_callback(_, cq: CallbackQuery):
                 st = "ON" if max_size_enabled else "OFF"
             await db_mgr.save_all()
             await cq.answer(f"📏 Size Cap: {st}")
-            await safe_edit(cq.message, _build_dl_prompt_text(remote_path), reply_markup=mode_keyboard(remote_path))
+            await safe_edit(
+                cq.message,
+                _build_dl_prompt_text(remote_path, is_single_file=is_single),
+                reply_markup=mode_keyboard(remote_path, is_single_file=is_single),
+            )
             return
 
         if sub == "go":
             chosen = parts[2]
             mode = "video" if chosen == "video" else "document"
-            if active_sessions:
+            if _has_active_session():
                 await cq.answer("⚠️ A job is already running!", show_alert=True)
                 return
             with state_lock:
@@ -4029,16 +5099,21 @@ async def on_callback(_, cq: CallbackQuery):
                 job_types = set(enabled_file_types)
                 ft_badge = _fmt_file_types_badge(job_types)
 
-            await cq.answer(f"Starting ({ft_badge})…")
+            await cq.answer("Starting transfer…")
             await safe_edit(
                 cq.message,
                 f"🔍 **Scanning Remote**\n"
                 f"📂 `{remote_path}`\n"
-                f"🎯 Filter: `{ft_badge}`",
+                + ("" if is_single else f"🎯 Filter: `{ft_badge}`"),
             )
 
             try:
-                files = await rclone_list(remote_path, user_id=user_id, allowed_types=job_types)
+                files = await rclone_list(
+                    remote_path,
+                    user_id=user_id,
+                    allowed_types=job_types,
+                    skip_type_filter=is_single,
+                )
             except Exception as e:
                 with stats_lock:
                     stats["last_error"] = str(e)[:200]
@@ -4056,7 +5131,7 @@ async def on_callback(_, cq: CallbackQuery):
                     f"📂 `{remote_path}`\n"
                     f"🎯 Filter: `{ft_badge}`\n\n"
                     f"_Switch the file type filter below and try again:_",
-                    reply_markup=mode_keyboard(remote_path),
+                    reply_markup=mode_keyboard(remote_path, is_single_file=is_single),
                 )
                 return
 
@@ -4071,7 +5146,9 @@ async def on_callback(_, cq: CallbackQuery):
             return
 
 
-# ── 14. Startup Lifecycle, Auto Command Registration & Auto-Resume Hook ───────
+# ==============================================================================
+#  STEP 14: Startup Lifecycle, Auto Command Registration & Auto-Resume Hook
+# ==============================================================================
 async def _async_main():
     if psutil is not None:
         try:
@@ -4092,7 +5169,7 @@ async def _async_main():
     log.info(
         f"🚀 Bot @{me.username} (ID: {me.id}) online via {MTPROTO_ENGINE} "
         f"[CONCURRENT_JOBS={CONCURRENT_JOBS}x, UPLOAD_WORKERS={UPLOAD_WORKERS}w, "
-        f"STREAMS={RCLONE_STREAMS}s, BUF={RCLONE_BUFFER_SIZE}, "
+        f"STREAMS={RCLONE_STREAMS}s, BUF={RCLONE_BUFFER_SIZE}, DUMP={DUMP_CHAT_ID}, "
         f"TYPES={','.join(sorted(enabled_file_types))}]!"
     )
 
